@@ -18,6 +18,7 @@ Initial backend/service/CLI scaffold for Agent Diary.
 - `docs/future-derived-data-model.md`
 - `docs/open-loops-producer-v1.md`
 - `docs/guinea-pig-testing-quickstart.md`
+- `docs/ops-sync-authority.md`
 
 ## Quick start
 
