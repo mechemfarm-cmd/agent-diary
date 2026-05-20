@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Diary UI Shell</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#detailBody">Skip to diary entry</a>
+    <header class="topbar" role="banner">
+      <h1>Agent Diary</h1>
+      <div class="api-config" role="group" aria-label="API connection">
+        <label for="apiBase">API Base</label>
+        <input id="apiBase" type="text" value="http://127.0.0.1:8041" autocomplete="off" />
+        <button id="reloadBtn">Reload</button>
+      </div>
+    </header>
+
+    <main class="layout" role="main">
+      <section class="panel panel-timeline" aria-labelledby="timelineHeading">
+        <h2 id="timelineHeading">Timeline</h2>
+        <div class="panel-actions">
+          <button id="prevPageBtn" aria-label="Previous timeline page">Prev</button>
+          <button id="nextPageBtn" aria-label="Next timeline page">Next</button>
+        </div>
+        <p id="timelineStatus" class="status-line" role="status" aria-live="polite"></p>
+        <ul id="timelineList" class="list" role="list" aria-label="Diary timeline entries"></ul>
+      </section>
+
+      <section class="panel panel-detail" aria-labelledby="detailHeading">
+        <h2 id="detailHeading">Diary Entry</h2>
+        <p id="detailStatus" class="status-line" role="status" aria-live="polite"></p>
+        <div id="detailMeta" class="meta" aria-label="Entry metadata"></div>
+        <article id="detailBody" class="raw-body" tabindex="-1">Select an entry to view raw detail.</article>
+        <details id="artifactDetails" aria-label="Secondary artifact metadata">
+          <summary>Artifacts (secondary)</summary>
+          <ul id="artifactList" class="list secondary" role="list" aria-label="Entry artifacts"></ul>
+        </details>
+      </section>
+
+      <section class="panel panel-search" aria-labelledby="searchHeading">
+        <h2 id="searchHeading">Search (Compressed Memory)</h2>
+        <form id="searchForm" class="search-form" role="search" aria-label="Search compressed memory">
+          <label for="searchInput" class="sr-only">Search memory</label>
+          <input id="searchInput" type="text" placeholder="Search memory..." required />
+          <button type="submit">Search</button>
+        </form>
+        <p id="searchStatus" class="status-line" role="status" aria-live="polite"></p>
+        <ul id="searchResults" class="list" role="list" aria-label="Search result entries"></ul>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
