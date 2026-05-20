@@ -1,0 +1,10 @@
+# Python cache / virtualenv
+__pycache__/
+*.pyc
+.venv/
+
+# Local runtime outputs (keep config only)
+data/entries/
+data/artifacts/
+data/overlays/
+data/index/memory.db
