@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent_diary.config import Paths
 from agent_diary.models.types import Artifact, Overlay, RawEntry
+from agent_diary.storage.imports import ensure_import_dirs
 
 
 def ensure_data_dirs(paths: Paths) -> None:
@@ -13,10 +14,12 @@ def ensure_data_dirs(paths: Paths) -> None:
         paths.entries_dir,
         paths.overlays_dir,
         paths.artifacts_dir,
+        paths.imports_dir,
         paths.index_dir,
         paths.config_dir,
     ):
         p.mkdir(parents=True, exist_ok=True)
+    ensure_import_dirs(paths)
 
 
 def _entry_path(entries_dir: Path, entry_id: str, created_at: str) -> Path:

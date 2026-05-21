@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent_diary.cli.session_builder import TranscriptMessage, build_session_entries, build_session_jsonl
+from agent_diary.cli.transcript_adapter import adapt_session_export
 from agent_diary.config import default_paths
 from agent_diary.index.sqlite_index import bootstrap_sqlite
 from agent_diary.service.handlers import (
@@ -16,7 +18,9 @@ from agent_diary.service.handlers import (
     attach_artifact,
     fetch_entry_detail,
     fetch_raw_entry,
+    import_session_jsonl,
     list_entries,
+    list_imports,
     produce_open_loops,
     search_memory,
     status,
@@ -598,6 +602,843 @@ class AppendEntrySliceTests(unittest.TestCase):
         artifact_file = Path(produced["artifact_file"])
         loops = json.loads(json.loads(artifact_file.read_text(encoding="utf-8"))["content"])["loops"]
         self.assertEqual(len(loops), 0)
+
+    def test_import_session_jsonl_writes_manifest_and_truthful_ingestion_metadata(self) -> None:
+        source_file = self.root / "session.jsonl"
+        source_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "entry_type": "chat_log",
+                            "source": "telegram-direct-import",
+                            "author_role": "human",
+                            "created_at": "2026-05-25T12:00:00+00:00",
+                            "content": "We should preserve the raw record.",
+                            "metadata": {"source_message_id": "m1"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "entry_type": "chat_log",
+                            "source": "telegram-direct-import",
+                            "author_role": "agent",
+                            "created_at": "2026-05-25T12:01:00+00:00",
+                            "content": "Agreed. Let's make imports idempotent.",
+                            "metadata": {"source_message_id": "m2"},
+                        }
+                    ),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import_test_truthful",
+                "source_session_id": "session-123",
+                "source_conversation_id": "telegram:713733361",
+            },
+        )
+
+        self.assertEqual(result["imported_count"], 2)
+        self.assertEqual(result["skipped_count"], 0)
+        manifest_path = Path(result["manifest_path"])
+        self.assertTrue(manifest_path.exists())
+        ledger_path = Path(result["ledger_path"])
+        self.assertTrue(ledger_path.exists())
+
+        entry_id = result["imported"][0]["entry_id"]
+        fetched = fetch_raw_entry(self.paths, {"entry_id": entry_id})
+        ingestion = fetched["entry"]["metadata"]["ingestion"]
+        self.assertTrue(ingestion["truthful_source"])
+        self.assertEqual(ingestion["import_mode"], "session_jsonl")
+        self.assertEqual(ingestion["import_id"], "import_test_truthful")
+        self.assertEqual(ingestion["source_session_id"], "session-123")
+        self.assertEqual(ingestion["source_conversation_id"], "telegram:713733361")
+
+    def test_import_session_jsonl_skips_duplicate_source_items_on_repeat_run(self) -> None:
+        source_file = self.root / "repeat.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T13:00:00+00:00",
+                    "content": "Same message should not import twice.",
+                    "metadata": {"source_message_id": "dup-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        first = import_session_jsonl(self.paths, {"path": str(source_file), "import_id": "import_dup_first"})
+        second = import_session_jsonl(self.paths, {"path": str(source_file), "import_id": "import_dup_second"})
+
+        self.assertEqual(first["imported_count"], 1)
+        self.assertEqual(second["imported_count"], 0)
+        self.assertEqual(second["skipped_count"], 1)
+        self.assertEqual(second["skipped"][0]["reason"], "duplicate_source_item")
+
+    def test_import_session_jsonl_dry_run_reports_without_writing_entries(self) -> None:
+        source_file = self.root / "dry-run.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T14:00:00+00:00",
+                    "content": "Preview this import only.",
+                    "metadata": {"source_message_id": "dry-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = import_session_jsonl(self.paths, {"path": str(source_file), "dry_run": True, "import_id": "import_dry"})
+
+        self.assertEqual(result["imported_count"], 1)
+        self.assertEqual(result["skipped_count"], 0)
+        self.assertNotIn("ledger_path", result)
+        self.assertTrue(Path(result["manifest_path"]).exists())
+        self.assertEqual(list(self.paths.entries_dir.glob("**/*.json")), [])
+
+    def test_build_session_entries_groups_messages_and_preserves_ids(self) -> None:
+        transcript = self.root / "transcript.jsonl"
+        transcript.write_text(
+            "\n".join(
+                [
+                    json.dumps({"message_id": "1", "created_at": "2026-05-25T10:00:00+00:00", "author_role": "human", "speaker": "Bill", "content": "First"}),
+                    json.dumps({"message_id": "2", "created_at": "2026-05-25T10:05:00+00:00", "author_role": "agent", "speaker": "Tom", "content": "Second"}),
+                    json.dumps({"message_id": "3", "created_at": "2026-05-25T11:10:00+00:00", "author_role": "human", "speaker": "Bill", "content": "Third"}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+        out_path = self.root / "built.jsonl"
+        result = build_session_jsonl(
+            input_path=transcript,
+            output_path=out_path,
+            source="telegram-direct-import",
+            gap_minutes=30,
+            max_chars=4000,
+        )
+
+        self.assertEqual(result["message_count"], 3)
+        self.assertEqual(result["entry_count"], 2)
+        built_lines = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(built_lines[0]["author_role"], "mixed")
+        self.assertEqual(built_lines[0]["metadata"]["source_message_ids"], ["1", "2"])
+        self.assertIn("Bill: First", built_lines[0]["content"])
+        self.assertIn("Tom: Second", built_lines[0]["content"])
+        self.assertEqual(built_lines[1]["metadata"]["source_message_ids"], ["3"])
+
+    def test_build_session_entries_splits_on_max_chars(self) -> None:
+        messages = [
+            TranscriptMessage(
+                message_id="1",
+                created_at="2026-05-25T10:00:00+00:00",
+                author_role="human",
+                speaker="Bill",
+                content="A" * 160,
+                metadata={},
+            ),
+            TranscriptMessage(
+                message_id="2",
+                created_at="2026-05-25T10:01:00+00:00",
+                author_role="agent",
+                speaker="Tom",
+                content="B" * 160,
+                metadata={},
+            ),
+        ]
+        built = build_session_entries(
+            messages,
+            source="telegram-direct-import",
+            gap_minutes=30,
+            max_chars=200,
+        )
+        self.assertEqual(len(built), 2)
+
+    def test_build_transcript_jsonl_generic_message_jsonl_outputs_canonical_shape(self) -> None:
+        source_file = self.root / "raw-generic.jsonl"
+        source_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "g1",
+                            "timestamp": "2026-05-27T09:00:00+00:00",
+                            "role": "user",
+                            "speaker": "Bill",
+                            "text": "Hello there",
+                            "metadata": {"channel": "telegram"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "message_id": "g2",
+                            "created_at": "2026-05-27T09:01:00+00:00",
+                            "author_role": "assistant",
+                            "content": "Hi Bill",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_path = self.root / "transcript.jsonl"
+
+        result = adapt_session_export(
+            input_path=source_file,
+            output_path=out_path,
+            format_name="generic-message-jsonl",
+            source_session_id="session-abc",
+            source_conversation_id="conv-xyz",
+        )
+
+        self.assertEqual(result["message_count"], 2)
+        lines = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(lines[0]["message_id"], "g1")
+        self.assertEqual(lines[0]["created_at"], "2026-05-27T09:00:00+00:00")
+        self.assertEqual(lines[0]["author_role"], "human")
+        self.assertEqual(lines[0]["speaker"], "Bill")
+        self.assertEqual(lines[0]["content"], "Hello there")
+        self.assertIn("metadata", lines[0])
+        self.assertEqual(lines[0]["metadata"]["source_message_id"], "g1")
+        self.assertEqual(lines[1]["author_role"], "agent")
+
+    def test_build_transcript_jsonl_rejects_malformed_input(self) -> None:
+        source_file = self.root / "bad-generic.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "id": "bad-1",
+                    "timestamp": "2026-05-27T09:00:00+00:00",
+                    "role": "user",
+                    # content/text/message intentionally missing
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError):
+            adapt_session_export(
+                input_path=source_file,
+                output_path=self.root / "unused.jsonl",
+                format_name="generic-message-jsonl",
+            )
+
+    def test_build_transcript_jsonl_openclaw_session_json_preserves_source_ids(self) -> None:
+        source_file = self.root / "openclaw-session.json"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "session_id": "oc-session-1",
+                    "conversation_id": "oc-conv-1",
+                    "messages": [
+                        {
+                            "id": "m-001",
+                            "created_at": "2026-05-27T10:00:00+00:00",
+                            "role": "user",
+                            "speaker": "Willard",
+                            "content": "Need follow-up reminder",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        out_path = self.root / "openclaw-transcript.jsonl"
+
+        result = adapt_session_export(
+            input_path=source_file,
+            output_path=out_path,
+            format_name="openclaw-session-json",
+        )
+
+        self.assertEqual(result["source_session_id"], "oc-session-1")
+        self.assertEqual(result["source_conversation_id"], "oc-conv-1")
+        row = json.loads(out_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(row["message_id"], "m-001")
+        self.assertEqual(row["created_at"], "2026-05-27T10:00:00+00:00")
+        self.assertEqual(row["metadata"]["source_message_id"], "m-001")
+        self.assertEqual(row["metadata"]["source_session_id"], "oc-session-1")
+        self.assertEqual(row["metadata"]["source_conversation_id"], "oc-conv-1")
+
+    def test_build_transcript_jsonl_openclaw_telegram_jsonl_preserves_truth_fields(self) -> None:
+        source_file = self.root / "telegram-source.json"
+        source_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "key": "default:713733361:5316",
+                            "node": {
+                                "sourceMessage": {
+                                    "message_id": 5316,
+                                    "from": {"id": 713733361, "is_bot": False, "username": "Willardmechem"},
+                                    "chat": {"id": 713733361, "type": "private"},
+                                    "date": 1778932179,
+                                    "text": "so looks like we're all good",
+                                }
+                            },
+                        }
+                    )
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_path = self.root / "telegram-transcript.jsonl"
+        result = adapt_session_export(
+            input_path=source_file,
+            output_path=out_path,
+            format_name="openclaw-telegram-jsonl",
+        )
+
+        self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["source_conversation_id"], "telegram:713733361")
+        row = json.loads(out_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(row["message_id"], "5316")
+        self.assertEqual(row["author_role"], "human")
+        self.assertEqual(row["speaker"], "Willardmechem")
+        self.assertEqual(row["content"], "so looks like we're all good")
+        self.assertTrue(row["created_at"].startswith("2026-"))
+        self.assertEqual(row["metadata"]["source_key"], "default:713733361:5316")
+        self.assertEqual(row["metadata"]["source_message_id"], "5316")
+        self.assertEqual(row["metadata"]["telegram_chat_id"], 713733361)
+
+    def test_build_transcript_jsonl_openclaw_telegram_jsonl_rejects_missing_source_message(self) -> None:
+        source_file = self.root / "telegram-bad.json"
+        source_file.write_text(json.dumps({"key": "bad", "node": {}}) + "\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            adapt_session_export(
+                input_path=source_file,
+                output_path=self.root / "unused-telegram.jsonl",
+                format_name="openclaw-telegram-jsonl",
+            )
+
+    def test_build_transcript_jsonl_openclaw_session_jsonl_maps_user_and_assistant_text(self) -> None:
+        source_file = self.root / "session-log.jsonl"
+        source_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session",
+                            "version": 3,
+                            "id": "session-123",
+                            "timestamp": "2026-05-21T06:46:22.209Z",
+                            "cwd": "/home/willard",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "msg-1",
+                            "parentId": None,
+                            "timestamp": "2026-05-21T06:46:22.208Z",
+                            "message": {
+                                "role": "user",
+                                "content": "hello there",
+                                "timestamp": 1779345982195,
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "msg-2",
+                            "parentId": "msg-1",
+                            "timestamp": "2026-05-21T06:46:22.210Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "toolCall", "name": "memory_search"},
+                                    {"type": "text", "text": "Here is the reply text."},
+                                    {"type": "toolResult", "toolCallId": "x"},
+                                ],
+                                "timestamp": 1779345982210,
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_path = self.root / "session-transcript.jsonl"
+
+        result = adapt_session_export(
+            input_path=source_file,
+            output_path=out_path,
+            format_name="openclaw-session-jsonl",
+        )
+
+        self.assertEqual(result["message_count"], 2)
+        rows = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(rows[0]["message_id"], "msg-1")
+        self.assertEqual(rows[0]["author_role"], "human")
+        self.assertEqual(rows[0]["speaker"], "User")
+        self.assertEqual(rows[0]["content"], "hello there")
+        self.assertEqual(rows[0]["metadata"]["source_session_id"], "session-123")
+        self.assertNotIn("source_parent_id", rows[0]["metadata"])
+        self.assertEqual(rows[1]["message_id"], "msg-2")
+        self.assertEqual(rows[1]["author_role"], "agent")
+        self.assertEqual(rows[1]["speaker"], "Assistant")
+        self.assertEqual(rows[1]["content"], "Here is the reply text.")
+        self.assertEqual(rows[1]["metadata"]["source_parent_id"], "msg-1")
+        self.assertEqual(rows[1]["metadata"]["openclaw_message_role"], "assistant")
+        self.assertEqual(rows[1]["metadata"]["source_session_cwd"], "/home/willard")
+
+    def test_build_transcript_jsonl_openclaw_session_jsonl_skips_tool_only_assistant_messages(self) -> None:
+        source_file = self.root / "session-tool-only.jsonl"
+        source_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "msg-1",
+                            "parentId": None,
+                            "timestamp": "2026-05-21T06:46:22.210Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "toolCall", "name": "memory_search"}],
+                                "timestamp": 1779345982210,
+                            },
+                        }
+                    )
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_path = self.root / "session-tool-only-transcript.jsonl"
+
+        result = adapt_session_export(
+            input_path=source_file,
+            output_path=out_path,
+            format_name="openclaw-session-jsonl",
+        )
+
+        self.assertEqual(result["message_count"], 0)
+        self.assertEqual(out_path.read_text(encoding="utf-8"), "")
+
+    def test_build_transcript_jsonl_openclaw_session_jsonl_rejects_bad_message_record(self) -> None:
+        source_file = self.root / "session-bad.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "msg-1",
+                    "parentId": None,
+                    "timestamp": "2026-05-21T06:46:22.210Z",
+                    "message": "not an object",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            adapt_session_export(
+                input_path=source_file,
+                output_path=self.root / "unused-session.jsonl",
+                format_name="openclaw-session-jsonl",
+            )
+
+    def _write_openclaw_session_fixture(self, path: Path) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session",
+                            "version": 3,
+                            "id": "session-plain-1",
+                            "timestamp": "2026-05-21T10:00:00.000Z",
+                            "cwd": "/home/willard",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "m-1",
+                            "parentId": None,
+                            "timestamp": "2026-05-21T10:00:01.000Z",
+                            "message": {
+                                "role": "user",
+                                "content": "hello there",
+                                "timestamp": 1779360001000,
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "m-2",
+                            "parentId": "m-1",
+                            "timestamp": "2026-05-21T10:00:02.000Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "toolCall", "name": "memory_search"},
+                                    {"type": "text", "text": "hi there"},
+                                    {"type": "toolResult", "toolCallId": "x"},
+                                ],
+                                "timestamp": 1779360002000,
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "m-3",
+                            "parentId": "m-2",
+                            "timestamp": "2026-05-21T10:00:03.000Z",
+                            "message": {
+                                "role": "user",
+                                "content": "what should we do next?",
+                                "timestamp": 1779360003000,
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "m-4",
+                            "parentId": "m-3",
+                            "timestamp": "2026-05-21T10:00:04.000Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "text", "text": "We should keep the scope narrow."}
+                                ],
+                                "timestamp": 1779360004000,
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_import_openclaw_session_command_imports_fixture(self) -> None:
+        source_file = self.root / "openclaw-session.jsonl"
+        self._write_openclaw_session_fixture(source_file)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-openclaw-session",
+            "--input-path",
+            str(source_file),
+            "--source",
+            "openclaw-session-import",
+            "--source-session-id",
+            "session-plain-1",
+            "--source-conversation-id",
+            "openclaw:session-plain-1",
+            "--import-id",
+            "import-test-plain",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        out = json.loads(completed.stdout)
+        self.assertFalse(out["dry_run"])
+        self.assertEqual(out["resolved_source_session_id"], "session-plain-1")
+        self.assertEqual(out["resolved_source_conversation_id"], "openclaw:session-plain-1")
+        self.assertEqual(out["source_session_id"], "session-plain-1")
+        self.assertEqual(out["source_conversation_id"], "openclaw:session-plain-1")
+        self.assertEqual(out["transcript_message_count"], 4)
+        self.assertEqual(out["session_chunk_count"], 1)
+        self.assertEqual(out["imported_count"], 1)
+        self.assertEqual(out["skipped_duplicate_count"], 0)
+        self.assertEqual(out["import_id"], "import-test-plain")
+        self.assertIn("session=session-plain-1", out["import_label"])
+        self.assertIn("conversation=openclaw:session-plain-1", out["import_label"])
+        self.assertIsInstance(out["batch_manifest_path"], str)
+        self.assertTrue(out["batch_manifest_path"].endswith("import-test-plain.json"))
+        self.assertEqual(out["adapter"]["message_count"], 4)
+        self.assertEqual(out["session_builder"]["entry_count"], 1)
+        self.assertEqual(out["import_result"]["imported_count"], 1)
+        self.assertEqual(out["import_result"]["skipped_count"], 0)
+
+        entry_id = out["import_result"]["imported"][0]["entry_id"]
+        fetched = fetch_raw_entry(self.paths, {"entry_id": entry_id})
+        self.assertEqual(fetched["entry"]["source"], "openclaw-session-import")
+        self.assertEqual(fetched["entry"]["metadata"]["ingestion"]["truthful_source"], True)
+        self.assertEqual(fetched["entry"]["metadata"]["ingestion"]["import_mode"], "session_jsonl")
+        self.assertEqual(fetched["entry"]["metadata"]["ingestion"]["source_session_id"], "session-plain-1")
+
+    def test_import_openclaw_session_command_dry_run_does_not_write_raw_entries(self) -> None:
+        source_file = self.root / "openclaw-session-dry-run.jsonl"
+        self._write_openclaw_session_fixture(source_file)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-openclaw-session",
+            "--input-path",
+            str(source_file),
+            "--source-session-id",
+            "session-plain-1",
+            "--source-conversation-id",
+            "openclaw:session-plain-1",
+            "--dry-run",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        out = json.loads(completed.stdout)
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(out["resolved_source_session_id"], "session-plain-1")
+        self.assertEqual(out["resolved_source_conversation_id"], "openclaw:session-plain-1")
+        self.assertEqual(out["transcript_message_count"], 4)
+        self.assertEqual(out["session_chunk_count"], 1)
+        self.assertEqual(out["imported_count"], 1)
+        self.assertEqual(out["skipped_duplicate_count"], 0)
+        self.assertIsInstance(out["batch_manifest_path"], str)
+        self.assertTrue(out["batch_manifest_path"].endswith(".json"))
+        self.assertEqual(out["import_result"]["imported_count"], 1)
+        self.assertEqual(out["import_result"]["skipped_count"], 0)
+        self.assertEqual(list_entries(self.paths, {"limit": 10, "offset": 0})["items"], [])
+
+    def test_import_openclaw_session_command_skips_duplicate_on_repeat_run(self) -> None:
+        source_file = self.root / "openclaw-session-repeat.jsonl"
+        self._write_openclaw_session_fixture(source_file)
+
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-openclaw-session",
+            "--input-path",
+            str(source_file),
+            "--source-session-id",
+            "session-plain-1",
+            "--source-conversation-id",
+            "openclaw:session-plain-1",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+
+        first = subprocess.run(
+            base_cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        first_out = json.loads(first.stdout)
+        self.assertEqual(first_out["resolved_source_session_id"], "session-plain-1")
+        self.assertEqual(first_out["resolved_source_conversation_id"], "openclaw:session-plain-1")
+        self.assertEqual(first_out["transcript_message_count"], 4)
+        self.assertEqual(first_out["session_chunk_count"], 1)
+        self.assertEqual(first_out["imported_count"], 1)
+        self.assertEqual(first_out["skipped_duplicate_count"], 0)
+        self.assertEqual(first_out["import_result"]["imported_count"], 1)
+        self.assertEqual(first_out["import_result"]["skipped_count"], 0)
+
+        second = subprocess.run(
+            base_cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        second_out = json.loads(second.stdout)
+        self.assertEqual(second_out["resolved_source_session_id"], "session-plain-1")
+        self.assertEqual(second_out["resolved_source_conversation_id"], "openclaw:session-plain-1")
+        self.assertEqual(second_out["transcript_message_count"], 4)
+        self.assertEqual(second_out["session_chunk_count"], 1)
+        self.assertEqual(second_out["imported_count"], 0)
+        self.assertEqual(second_out["skipped_duplicate_count"], 1)
+        self.assertEqual(second_out["import_result"]["imported_count"], 0)
+        self.assertEqual(second_out["import_result"]["skipped_count"], 1)
+
+    def test_import_openclaw_session_command_infers_source_identifiers_when_omitted(self) -> None:
+        source_file = self.root / "openclaw-session-infer.jsonl"
+        self._write_openclaw_session_fixture(source_file)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-openclaw-session",
+            "--input-path",
+            str(source_file),
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["resolved_source_session_id"], "session-plain-1")
+        self.assertEqual(out["resolved_source_conversation_id"], "openclaw:session-plain-1")
+        self.assertTrue(out["import_id"].startswith("import-openclaw-session-import-session-plain-1-"))
+        self.assertIn("session=session-plain-1", out["import_label"])
+        self.assertIn("conversation=openclaw:session-plain-1", out["import_label"])
+        self.assertEqual(out["import_result"]["imported_count"], 1)
+        self.assertEqual(out["import_result"]["skipped_count"], 0)
+
+        entry_id = out["import_result"]["imported"][0]["entry_id"]
+        fetched = fetch_raw_entry(self.paths, {"entry_id": entry_id})
+        ingestion = fetched["entry"]["metadata"]["ingestion"]
+        self.assertEqual(ingestion["source_session_id"], "session-plain-1")
+        self.assertEqual(ingestion["source_conversation_id"], "openclaw:session-plain-1")
+
+    def test_import_openclaw_session_command_explicit_ids_override_inferred_defaults(self) -> None:
+        source_file = self.root / "openclaw-session-override.jsonl"
+        self._write_openclaw_session_fixture(source_file)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-openclaw-session",
+            "--input-path",
+            str(source_file),
+            "--source-session-id",
+            "manual-session-override",
+            "--source-conversation-id",
+            "manual-conversation-override",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["resolved_source_session_id"], "manual-session-override")
+        self.assertEqual(out["resolved_source_conversation_id"], "manual-conversation-override")
+        self.assertIn("session=manual-session-override", out["import_label"])
+        self.assertIn("conversation=manual-conversation-override", out["import_label"])
+        self.assertTrue(out["import_id"].startswith("import-openclaw-session-import-manual-session-override-"))
+
+        entry_id = out["import_result"]["imported"][0]["entry_id"]
+        fetched = fetch_raw_entry(self.paths, {"entry_id": entry_id})
+        ingestion = fetched["entry"]["metadata"]["ingestion"]
+        self.assertEqual(ingestion["source_session_id"], "manual-session-override")
+        self.assertEqual(ingestion["source_conversation_id"], "manual-conversation-override")
+
+    def test_list_imports_returns_recent_manifests_newest_first(self) -> None:
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(self._write_session_import_fixture("manifest-older.jsonl", "older-1")),
+                "import_id": "import-old",
+                "source_session_id": "session-old",
+                "source_conversation_id": "conv-old",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(self._write_session_import_fixture("manifest-newer.jsonl", "newer-1")),
+                "import_id": "import-new",
+                "source_session_id": "session-new",
+                "source_conversation_id": "conv-new",
+            },
+        )
+
+        result = list_imports(self.paths, {"limit": 10})
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["items"][0]["import_id"], "import-new")
+        self.assertEqual(result["items"][1]["import_id"], "import-old")
+        self.assertEqual(result["items"][0]["source_session_id"], "session-new")
+        self.assertTrue(result["items"][0]["batch_manifest_path"].endswith("import-new.json"))
+
+    def test_list_imports_honors_limit(self) -> None:
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(self._write_session_import_fixture("manifest-a.jsonl", "a-1")),
+                "import_id": "import-a",
+                "source_session_id": "session-a",
+                "source_conversation_id": "conv-a",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(self._write_session_import_fixture("manifest-b.jsonl", "b-1")),
+                "import_id": "import-b",
+                "source_session_id": "session-b",
+                "source_conversation_id": "conv-b",
+            },
+        )
+
+        result = list_imports(self.paths, {"limit": 1})
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(len(result["items"]), 1)
+
+    def _write_session_import_fixture(self, filename: str, source_message_id: str) -> Path:
+        source_file = self.root / filename
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "openclaw-session-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-27T10:00:00+00:00",
+                    "content": "Bill: hello\nTom: hi",
+                    "metadata": {"source_message_id": source_message_id},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return source_file
 
 
 if __name__ == "__main__":

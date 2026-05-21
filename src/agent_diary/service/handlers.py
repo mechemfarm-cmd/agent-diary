@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+from uuid import uuid4
 
 from agent_diary.analytics.open_loops import build_open_loops_payload, collect_source_rows
 from agent_diary.config import Paths
@@ -20,6 +21,13 @@ from agent_diary.index.repository import (
 from agent_diary.models.types import Artifact, RawEntry
 from agent_diary.storage.entry_reader import fetch_raw_entry as fetch_entry_from_files
 from agent_diary.storage.files import append_artifact, append_raw_entry
+from agent_diary.storage.imports import (
+    build_source_item_key,
+    list_import_batch_manifests,
+    load_import_ledger,
+    save_import_ledger,
+    write_import_batch_manifest,
+)
 
 
 def _require_fields(payload: dict[str, Any], fields: list[str]) -> None:
@@ -37,6 +45,161 @@ def append_entry(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     raw_path = append_raw_entry(paths, entry)
     insert_entry(paths.sqlite_path, entry, str(raw_path))
     return {"entry_id": entry.entry_id, "raw_file": str(raw_path)}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _make_import_id() -> str:
+    return f"import_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}_{uuid4().hex[:8]}"
+
+
+def import_session_jsonl(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    _require_fields(payload, ["path"])
+    import_path = Path(str(payload["path"])).expanduser().resolve()
+    if not import_path.exists():
+        raise FileNotFoundError(f"import file not found: {import_path}")
+
+    import_id = str(payload.get("import_id") or _make_import_id())
+    imported_at = _utc_now_iso()
+    source_session_id = str(payload.get("source_session_id", "")).strip() or None
+    source_conversation_id = str(payload.get("source_conversation_id", "")).strip() or None
+    dry_run = bool(payload.get("dry_run", False))
+
+    parsed_rows: list[dict[str, Any]] = []
+    with import_path.open("r", encoding="utf-8") as handle:
+        for idx, line in enumerate(handle, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            _require_fields(obj, ["entry_type", "source", "author_role", "content", "created_at"])
+            parsed_rows.append({"line": idx, "entry": obj})
+
+    ledger = load_import_ledger(paths)
+    ledger_items = ledger["items"]
+    imported: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for row in parsed_rows:
+        obj = dict(row["entry"])
+        metadata = obj.get("metadata", {})
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise ValueError(f"metadata must be an object on line {row['line']}")
+
+        if source_session_id and "source_session_id" not in metadata:
+            metadata["source_session_id"] = source_session_id
+        if source_conversation_id and "source_conversation_id" not in metadata:
+            metadata["source_conversation_id"] = source_conversation_id
+
+        source_item_key = build_source_item_key({**obj, "metadata": metadata})
+        if source_item_key in ledger_items:
+            existing = ledger_items[source_item_key]
+            skipped.append(
+                {
+                    "line": row["line"],
+                    "reason": "duplicate_source_item",
+                    "source_item_key": source_item_key,
+                    "existing_entry_id": existing["entry_id"],
+                }
+            )
+            continue
+
+        ingestion_meta = {
+            "truthful_source": True,
+            "import_mode": "session_jsonl",
+            "import_id": import_id,
+            "imported_at": imported_at,
+            "source_item_key": source_item_key,
+        }
+        if source_session_id:
+            ingestion_meta["source_session_id"] = source_session_id
+        if source_conversation_id:
+            ingestion_meta["source_conversation_id"] = source_conversation_id
+        metadata["ingestion"] = ingestion_meta
+
+        entry_payload = {
+            "entry_type": obj["entry_type"],
+            "source": obj["source"],
+            "author_role": obj["author_role"],
+            "content": obj["content"],
+            "created_at": obj["created_at"],
+            "metadata": metadata,
+        }
+        if "title" in obj:
+            entry_payload["title"] = obj["title"]
+
+        if dry_run:
+            imported.append({"line": row["line"], "source_item_key": source_item_key, "dry_run": True})
+            continue
+
+        result = append_entry(paths, entry_payload)
+        imported.append(
+            {
+                "line": row["line"],
+                "entry_id": result["entry_id"],
+                "raw_file": result["raw_file"],
+                "source_item_key": source_item_key,
+            }
+        )
+        ledger_items[source_item_key] = {
+            "entry_id": result["entry_id"],
+            "import_id": import_id,
+            "imported_at": imported_at,
+            "source": obj["source"],
+            "created_at": obj["created_at"],
+            "line": row["line"],
+        }
+
+    manifest = {
+        "import_id": import_id,
+        "imported_at": imported_at,
+        "import_mode": "session_jsonl",
+        "input_path": str(import_path),
+        "source_session_id": source_session_id,
+        "source_conversation_id": source_conversation_id,
+        "dry_run": dry_run,
+        "imported_count": len(imported),
+        "skipped_count": len(skipped),
+        "imported": imported,
+        "skipped": skipped,
+    }
+
+    if not dry_run:
+        ledger_path = save_import_ledger(paths, ledger)
+        manifest["ledger_path"] = str(ledger_path)
+    manifest_path = write_import_batch_manifest(paths, import_id=import_id, manifest=manifest)
+    manifest["manifest_path"] = str(manifest_path)
+    return manifest
+
+
+def list_imports(paths: Paths, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    limit = int(payload.get("limit", 20))
+    manifests = list_import_batch_manifests(paths, limit=limit)
+    items: list[dict[str, Any]] = []
+    for manifest in manifests:
+        import_result = manifest.get("import_result", {})
+        if not isinstance(import_result, dict):
+            import_result = {}
+        items.append(
+            {
+                "import_id": manifest.get("import_id"),
+                "import_label": manifest.get("import_label"),
+                "imported_at": manifest.get("imported_at"),
+                "imported_count": manifest.get("imported_count"),
+                "skipped_duplicate_count": manifest.get("skipped_count"),
+                "source_session_id": manifest.get("source_session_id"),
+                "source_conversation_id": manifest.get("source_conversation_id"),
+                "batch_manifest_path": manifest.get("manifest_path"),
+                "manifest_file": manifest.get("manifest_file"),
+                "dry_run": manifest.get("dry_run"),
+            }
+        )
+    return {"limit": limit, "count": len(items), "items": items}
 
 
 def _is_compressed_memory_artifact(artifact_type: str) -> bool:
