@@ -728,6 +728,8 @@ class AppendEntrySliceTests(unittest.TestCase):
             source="telegram-direct-import",
             gap_minutes=30,
             max_chars=4000,
+            min_messages_before_gap_split=1,
+            min_chars_before_gap_split=1,
         )
 
         self.assertEqual(result["message_count"], 3)
@@ -765,6 +767,78 @@ class AppendEntrySliceTests(unittest.TestCase):
             max_chars=200,
         )
         self.assertEqual(len(built), 2)
+
+    def test_build_session_entries_short_contiguous_exchange_stays_one_chunk(self) -> None:
+        messages = [
+            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Hi", {}),
+            TranscriptMessage("2", "2026-05-25T10:01:00+00:00", "agent", "Tom", "Hello", {}),
+            TranscriptMessage("3", "2026-05-25T10:02:00+00:00", "human", "Bill", "Need quick help", {}),
+        ]
+        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2", "3"])
+
+    def test_build_session_entries_long_gap_unrelated_restart_splits(self) -> None:
+        messages = [
+            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Can you send the deployment notes?", {}),
+            TranscriptMessage("2", "2026-05-25T12:00:00+00:00", "human", "Bill", "Different topic: lunch tomorrow?", {}),
+        ]
+        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
+        self.assertEqual(len(built), 2)
+
+    def test_build_session_entries_long_gap_obvious_continuation_stays_together(self) -> None:
+        messages = [
+            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Can you send the deployment notes?", {}),
+            TranscriptMessage("2", "2026-05-25T12:00:00+00:00", "agent", "Tom", "Done, sent now.", {}),
+        ]
+        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2"])
+
+    def test_build_session_entries_long_gap_same_task_groups_more_aggressively(self) -> None:
+        messages = [
+            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Need a codex build fix for android release pipeline.", {}),
+            TranscriptMessage("2", "2026-05-25T10:05:00+00:00", "agent", "Tom", "I can work that build issue.", {}),
+            TranscriptMessage("3", "2026-05-25T11:20:00+00:00", "human", "Bill", "The android build fix still matters; let's continue that pipeline task.", {}),
+        ]
+        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
+        self.assertEqual(len(built), 1)
+        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2", "3"])
+
+    def test_build_session_entries_splits_on_max_messages(self) -> None:
+        messages = [
+            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "one", {}),
+            TranscriptMessage("2", "2026-05-25T10:01:00+00:00", "agent", "Tom", "two", {}),
+            TranscriptMessage("3", "2026-05-25T10:02:00+00:00", "human", "Bill", "three", {}),
+        ]
+        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=2)
+        self.assertEqual(len(built), 2)
+        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2"])
+        self.assertEqual(built[1]["metadata"]["source_message_ids"], ["3"])
+
+    def test_build_session_entries_session_or_conversation_change_forces_split(self) -> None:
+        messages = [
+            TranscriptMessage(
+                "1",
+                "2026-05-25T10:00:00+00:00",
+                "human",
+                "Bill",
+                "first",
+                {"source_session_id": "s1", "source_conversation_id": "c1"},
+            ),
+            TranscriptMessage(
+                "2",
+                "2026-05-25T10:01:00+00:00",
+                "agent",
+                "Tom",
+                "second",
+                {"source_session_id": "s1", "source_conversation_id": "c2"},
+            ),
+        ]
+        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
+        self.assertEqual(len(built), 2)
+        self.assertEqual(built[0]["metadata"]["source_conversation_id"], "c1")
+        self.assertEqual(built[1]["metadata"]["source_conversation_id"], "c2")
 
     def test_build_transcript_jsonl_generic_message_jsonl_outputs_canonical_shape(self) -> None:
         source_file = self.root / "raw-generic.jsonl"

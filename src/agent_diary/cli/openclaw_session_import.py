@@ -35,8 +35,11 @@ def import_openclaw_session(
     source_session_id: str | None = None,
     source_conversation_id: str | None = None,
     dry_run: bool = False,
-    gap_minutes: int = 30,
-    max_chars: int = 4000,
+    gap_minutes: int = 60,
+    max_chars: int = 6000,
+    max_messages: int = 80,
+    min_messages_before_gap_split: int = 4,
+    min_chars_before_gap_split: int = 400,
 ) -> dict[str, Any]:
     ensure_import_dirs(paths)
     input_path = Path(input_path).expanduser().resolve()
@@ -67,6 +70,9 @@ def import_openclaw_session(
             source=source,
             gap_minutes=gap_minutes,
             max_chars=max_chars,
+            max_messages=max_messages,
+            min_messages_before_gap_split=min_messages_before_gap_split,
+            min_chars_before_gap_split=min_chars_before_gap_split,
         )
         import_result = import_session_jsonl(
             paths,
@@ -107,6 +113,9 @@ def import_openclaw_session(
             "source": session_result["source"],
             "gap_minutes": session_result["gap_minutes"],
             "max_chars": session_result["max_chars"],
+            "max_messages": session_result["max_messages"],
+            "min_messages_before_gap_split": session_result["min_messages_before_gap_split"],
+            "min_chars_before_gap_split": session_result["min_chars_before_gap_split"],
         },
         "import_result": import_result,
     }

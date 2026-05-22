@@ -104,8 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_openclaw_import.add_argument("--source-conversation-id", help="override or supply the source conversation id")
     p_openclaw_import.add_argument("--import-id", help="override the generated import batch id")
     p_openclaw_import.add_argument("--dry-run", action="store_true", help="show what would import without writing raw entries")
-    p_openclaw_import.add_argument("--gap-minutes", type=int, default=30, help="group transcript messages into a chunk when gaps exceed this many minutes")
-    p_openclaw_import.add_argument("--max-chars", type=int, default=4000, help="split session chunks when rendered text exceeds this many characters")
+    p_openclaw_import.add_argument("--gap-minutes", type=int, default=60, help="group transcript messages into a chunk when gaps exceed this many minutes")
+    p_openclaw_import.add_argument("--max-chars", type=int, default=6000, help="split session chunks when rendered text exceeds this many characters")
+    p_openclaw_import.add_argument("--max-messages", type=int, default=80, help="split session chunks when message count exceeds this many messages")
+    p_openclaw_import.add_argument("--min-messages-before-gap-split", type=int, default=4, help="do not split on a long gap unless the current chunk has at least this many messages")
+    p_openclaw_import.add_argument("--min-chars-before-gap-split", type=int, default=400, help="do not split on a long gap unless the current chunk has at least this many rendered characters")
 
     p_list_imports = sub.add_parser(
         "list-imports",
@@ -122,8 +125,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_build_session.add_argument("--input-path", required=True, help="canonical transcript-message JSONL input")
     p_build_session.add_argument("--output-path", required=True, help="output path for session-import JSONL")
     p_build_session.add_argument("--source", required=True, help="source label stored on imported raw entries")
-    p_build_session.add_argument("--gap-minutes", type=int, default=30, help="start a new chunk when message gaps exceed this many minutes")
-    p_build_session.add_argument("--max-chars", type=int, default=4000, help="start a new chunk when rendered text exceeds this many characters")
+    p_build_session.add_argument("--gap-minutes", type=int, default=60, help="start a new chunk when message gaps exceed this many minutes")
+    p_build_session.add_argument("--max-chars", type=int, default=6000, help="start a new chunk when rendered text exceeds this many characters")
+    p_build_session.add_argument("--max-messages", type=int, default=80, help="start a new chunk when message count exceeds this many messages")
+    p_build_session.add_argument("--min-messages-before-gap-split", type=int, default=4, help="do not split on a long gap unless the current chunk has at least this many messages")
+    p_build_session.add_argument("--min-chars-before-gap-split", type=int, default=400, help="do not split on a long gap unless the current chunk has at least this many rendered characters")
 
     p_build_transcript = sub.add_parser(
         "build-transcript-jsonl",
@@ -259,6 +265,9 @@ def main() -> None:
             source=args.source,
             gap_minutes=args.gap_minutes,
             max_chars=args.max_chars,
+            max_messages=args.max_messages,
+            min_messages_before_gap_split=args.min_messages_before_gap_split,
+            min_chars_before_gap_split=args.min_chars_before_gap_split,
         )
         _print(out, args.json)
         return
@@ -286,6 +295,9 @@ def main() -> None:
             dry_run=args.dry_run,
             gap_minutes=args.gap_minutes,
             max_chars=args.max_chars,
+            max_messages=args.max_messages,
+            min_messages_before_gap_split=args.min_messages_before_gap_split,
+            min_chars_before_gap_split=args.min_chars_before_gap_split,
         )
         _print(out, args.json)
         return
