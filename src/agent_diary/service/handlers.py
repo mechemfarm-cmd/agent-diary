@@ -8,6 +8,16 @@ import re
 from typing import Any
 from uuid import uuid4
 
+from agent_diary.analytics.conversation_briefs import (
+    build_conversation_brief_text,
+    collect_source_rows as collect_brief_source_rows,
+    entry_has_artifact_type,
+)
+from agent_diary.analytics.compressed_memory import (
+    build_compressed_memory_text,
+    collect_source_rows as collect_memory_source_rows,
+    entry_has_artifact_type as entry_has_memory_artifact_type,
+)
 from agent_diary.analytics.open_loops import build_open_loops_payload, collect_source_rows
 from agent_diary.config import Paths
 from agent_diary.index.repository import (
@@ -237,6 +247,43 @@ def _build_preview(text: str, size: int = 140) -> str:
     return compact[: size - 3] + "..."
 
 
+def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, Any]]:
+    terms = [t for t in re.findall(r"\w+", query.lower()) if t]
+    if not terms:
+        return []
+
+    candidates = list_entry_rows(paths.sqlite_path, limit=max(limit * 10, 200), offset=0)
+    scored: list[dict[str, Any]] = []
+    for row in candidates:
+        raw_file = Path(str(row["raw_file_path"]))
+        if not raw_file.exists():
+            continue
+        body = json.loads(raw_file.read_text(encoding="utf-8"))
+        content = str(body.get("content", ""))
+        lowered = content.lower()
+        if not any(term in lowered for term in terms):
+            continue
+        phrase_bonus = 100 if query.lower() in lowered else 0
+        coverage = sum(1 for term in terms if term in lowered)
+        frequency = sum(lowered.count(term) for term in terms)
+        scored.append(
+            {
+                "entry_id": row["entry_id"],
+                "artifact_id": None,
+                "indexed_at": row["created_at"],
+                "match_text": content,
+                "match_layer": "raw_entry_fallback",
+                "entry_type": body.get("entry_type", "unknown"),
+                "source": row["source"],
+                "author_role": row["author_role"],
+                "_score": phrase_bonus + (coverage * 10) + frequency,
+            }
+        )
+
+    scored.sort(key=lambda item: (item["_score"], item["indexed_at"]), reverse=True)
+    return [{k: v for k, v in item.items() if k != "_score"} for item in scored[:limit]]
+
+
 def attach_artifact(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     _require_fields(
         payload,
@@ -269,23 +316,45 @@ def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query", "")).strip()
     limit = int(payload.get("limit", 20))
     filters = payload.get("filters", {})
-    matches = search_index(paths.sqlite_path, query=query, limit=limit)
+    compressed_matches = search_index(paths.sqlite_path, query=query, limit=limit)
     linked_matches = [
         {
             "entry_id": row["entry_id"],
             "artifact_id": row["artifact_id"],
             "indexed_at": row["indexed_at"],
             "match_text": _build_snippet(str(row["match_text"]), query),
+            "match_layer": "compressed_memory",
             "fetch_raw_entry": {"entry_id": row["entry_id"]},
         }
-        for row in matches
+        for row in compressed_matches
     ]
+    fallback_matches: list[dict[str, Any]] = []
+    if not linked_matches:
+        fallback_matches = [
+            {
+                "entry_id": row["entry_id"],
+                "artifact_id": row["artifact_id"],
+                "indexed_at": row["indexed_at"],
+                "match_text": _build_snippet(str(row["match_text"]), query),
+                "match_layer": row["match_layer"],
+                "entry_type": row["entry_type"],
+                "source": row["source"],
+                "author_role": row["author_role"],
+                "fetch_raw_entry": {"entry_id": row["entry_id"]},
+            }
+            for row in _search_raw_entries(paths, query=query, limit=limit)
+        ]
     return {
         "query": query,
         "limit": limit,
         "filters": filters,
-        "matches": linked_matches,
-        "note": "compressed-memory index results; fetch_raw_entry for authoritative truth",
+        "matches": linked_matches or fallback_matches,
+        "match_summary": {
+            "compressed_memory_hits": len(linked_matches),
+            "raw_entry_fallback_hits": len(fallback_matches),
+            "using_fallback": not linked_matches and bool(fallback_matches),
+        },
+        "note": "Search prefers compressed-memory artifacts and falls back to raw-entry text when the compressed layer has no hits.",
     }
 
 
@@ -314,6 +383,13 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     for row in rows:
         raw_file = Path(row["raw_file_path"])
         body = json.loads(raw_file.read_text(encoding="utf-8"))
+        brief = None
+        artifact_dir = paths.artifacts_dir / row["entry_id"]
+        if artifact_dir.exists():
+            for artifact_file in sorted(artifact_dir.glob("*.json")):
+                artifact_body = json.loads(artifact_file.read_text(encoding="utf-8"))
+                if artifact_body.get("artifact_type") == "conversation-brief":
+                    brief = str(artifact_body.get("content", "")).strip() or None
         items.append(
             {
                 "entry_id": row["entry_id"],
@@ -321,6 +397,7 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
                 "entry_type": body.get("entry_type", "unknown"),
                 "source": row["source"],
                 "author_role": row["author_role"],
+                "brief": brief,
                 "preview": _build_preview(str(body.get("content", ""))),
             }
         )
@@ -345,6 +422,8 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "producer": a.get("producer"),
             "created_at": a.get("created_at"),
         }
+        if a.get("artifact_type") in {"memory", "compressed-memory", "conversation-brief"}:
+            artifact["content"] = a.get("content", "")
         if a.get("artifact_type") == "analysis:open-loop":
             try:
                 artifact["open_loops"] = json.loads(str(a.get("content", "{}"))).get("loops", [])
@@ -406,6 +485,116 @@ def produce_open_loops(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         "artifact_file": attached["artifact_file"],
         "loop_count": len(payload_content["loops"]),
         "source_entry_ids": source_entry_ids,
+    }
+
+
+def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    limit = int(payload.get("limit", 20))
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    entry_ids = payload.get("entry_ids")
+    normalized_entry_ids: list[str] | None = None
+    if entry_ids:
+        if not isinstance(entry_ids, list):
+            raise ValueError("entry_ids must be a list when provided")
+        normalized_entry_ids = [str(e).strip() for e in entry_ids if str(e).strip()]
+    force = bool(payload.get("force", False))
+
+    source_rows = collect_brief_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
+    if not source_rows:
+        raise FileNotFoundError("no source entries found for conversation-brief analysis")
+
+    produced: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for row in source_rows:
+        entry_id = str(row["entry_id"])
+        if not force and entry_has_artifact_type(paths, entry_id=entry_id, artifact_type="conversation-brief"):
+            skipped.append(entry_id)
+            continue
+        body = json.loads(Path(row["raw_file_path"]).read_text(encoding="utf-8"))
+        brief = build_conversation_brief_text(body)
+        attached = attach_artifact(
+            paths,
+            {
+                "entry_id": entry_id,
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": brief,
+                "metadata": {
+                    "schema_version": "conversation-brief.v1",
+                    "method": "deterministic-dialogue-brief-v1",
+                    "source_entry_id": entry_id,
+                },
+            },
+        )
+        produced.append(
+            {
+                "entry_id": entry_id,
+                "artifact_id": attached["artifact_id"],
+                "artifact_file": attached["artifact_file"],
+                "brief": brief,
+            }
+        )
+    return {
+        "produced_count": len(produced),
+        "skipped_count": len(skipped),
+        "produced": produced,
+        "skipped": skipped,
+    }
+
+
+def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    limit = int(payload.get("limit", 20))
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    entry_ids = payload.get("entry_ids")
+    normalized_entry_ids: list[str] | None = None
+    if entry_ids:
+        if not isinstance(entry_ids, list):
+            raise ValueError("entry_ids must be a list when provided")
+        normalized_entry_ids = [str(e).strip() for e in entry_ids if str(e).strip()]
+    force = bool(payload.get("force", False))
+
+    source_rows = collect_memory_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
+    if not source_rows:
+        raise FileNotFoundError("no source entries found for compressed-memory analysis")
+
+    produced: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for row in source_rows:
+        entry_id = str(row["entry_id"])
+        if not force and entry_has_memory_artifact_type(paths, entry_id=entry_id, artifact_type="compressed-memory"):
+            skipped.append(entry_id)
+            continue
+        body = json.loads(Path(row["raw_file_path"]).read_text(encoding="utf-8"))
+        memory_text = build_compressed_memory_text(body)
+        attached = attach_artifact(
+            paths,
+            {
+                "entry_id": entry_id,
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": memory_text,
+                "metadata": {
+                    "schema_version": "compressed-memory.v2",
+                    "method": "deterministic-dialogue-compression-v2",
+                    "source_entry_id": entry_id,
+                },
+            },
+        )
+        produced.append(
+            {
+                "entry_id": entry_id,
+                "artifact_id": attached["artifact_id"],
+                "artifact_file": attached["artifact_file"],
+                "indexed_in_memory": attached["indexed_in_memory"],
+            }
+        )
+    return {
+        "produced_count": len(produced),
+        "skipped_count": len(skipped),
+        "produced": produced,
+        "skipped": skipped,
     }
 
 

@@ -9,6 +9,7 @@ This is a minimal local UI shell implementing the v1 surface contract.
 - Memory search from `search_memory`
 - Click-through from search hit to entry detail via `entry_id`
 - Raw entry content shown as primary body
+- Mixed-speaker `chat_log` entries rendered as speaker-separated dialogue turns with distinct speaker colors
 - Artifacts shown as secondary metadata
 - `analysis:open-loop` artifacts rendered in the secondary artifact section with:
   - title
@@ -54,6 +55,7 @@ If needed, set `API Base` in the header (default: `http://127.0.0.1:8041`).
 2. In timeline or search results, use `ArrowUp`/`ArrowDown` plus `Home`/`End` to move between result buttons.
 3. Press `Enter` on a focused timeline/search item and confirm entry detail loads and focus moves to the diary body.
 4. Use the “Skip to diary entry” link at top to jump directly to the raw entry body.
-5. If an entry has `analysis:open-loop` artifacts, expand “Artifacts (secondary)” and verify loop cards render as derived interpretation with supporting-entry navigation.
+5. Open a mixed-speaker `chat_log` entry and confirm each turn is separated into a colored speaker block instead of a single wall of text.
+6. If an entry has `analysis:open-loop` artifacts, expand “Artifacts (secondary)” and verify loop cards render as derived interpretation with supporting-entry navigation.
 
 No automated UI accessibility tests are included in this shell pass.

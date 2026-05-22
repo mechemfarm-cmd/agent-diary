@@ -3,6 +3,11 @@
 Use `import-entries-jsonl` only for one-off seed data and synthetic corpus tests.
 For real recurring conversation ingestion from OpenClaw, use `import-openclaw-session`.
 
+For broader product design, treat the canonical transcript contract in
+`docs/canonical-conversation-transcript.md` as the transport-independent center
+of the ingestion system. Source-specific importers should normalize into that
+shape before chunking and import.
+
 Recommended path:
 
     PYTHONPATH=src python3 -m agent_diary.cli.main --json import-openclaw-session \
@@ -68,6 +73,21 @@ CLI help at a glance:
 - `build-session-jsonl` chunks transcript messages into session-import JSONL
 - `import-session-jsonl` imports session-import JSONL through the ledger
 - `import-openclaw-session` runs the full OpenClaw path in one command
+- `backfill-openclaw-session-key` discovers many OpenClaw session files from trajectory metadata and imports them as a controlled backfill
+
+Controlled backfill example:
+
+    PYTHONPATH=src python3 -m agent_diary.cli.main --json backfill-openclaw-session-key \
+      --session-key 'agent:main:telegram:default:direct:713733361' \
+      --trajectories-root ~/.openclaw/agents/main/sessions \
+      --days-back 30 \
+      --source telegram-direct-bootstrap \
+      --dry-run
+
+Notes:
+- use `--dry-run` first to inspect how many session files and transcript messages will be imported
+- this path uses trajectory `session.started` records as the authority for which session files belong to a session key
+- repeated runs still dedupe through the normal import ledger
 
 Plain OpenClaw session-log adapter notes:
 

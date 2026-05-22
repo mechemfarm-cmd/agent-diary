@@ -7,10 +7,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
+from agent_diary.cli.openclaw_session_import import backfill_openclaw_session_key, discover_openclaw_session_files
+from agent_diary.analytics.conversation_briefs import build_conversation_brief_text
+from agent_diary.analytics.compressed_memory import build_compressed_memory_text
 from agent_diary.cli.session_builder import TranscriptMessage, build_session_entries, build_session_jsonl
-from agent_diary.cli.transcript_adapter import adapt_session_export
+from agent_diary.cli.transcript_adapter import adapt_session_export, build_openclaw_telegram_direct_transcript
 from agent_diary.config import default_paths
 from agent_diary.index.sqlite_index import bootstrap_sqlite
 from agent_diary.service.handlers import (
@@ -21,6 +25,8 @@ from agent_diary.service.handlers import (
     import_session_jsonl,
     list_entries,
     list_imports,
+    produce_conversation_briefs,
+    produce_compressed_memory,
     produce_open_loops,
     search_memory,
     status,
@@ -188,6 +194,39 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(row[1], attached["artifact_id"])
         self.assertEqual(row[2], "2026-05-21T09:01:00+00:00")
         self.assertEqual(row[3], "user prefers concise status updates")
+
+    def test_build_conversation_brief_text_summarizes_dialogue(self) -> None:
+        text = build_conversation_brief_text(
+            {
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                    "Willardmechem: great. let me know if the tunnel still works."
+                )
+            }
+        )
+        self.assertIn("Bill starts with", text)
+        self.assertIn("Tom", text)
+        self.assertIn("browser node", text.lower())
+
+    def test_build_compressed_memory_text_preserves_questions_responses_and_keywords(self) -> None:
+        text = build_compressed_memory_text(
+            {
+                "created_at": "2026-05-22T12:00:00+00:00",
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                    "Willardmechem: great. let me know if the tunnel still works."
+                ),
+            }
+        )
+        self.assertIn("Source context:", text)
+        self.assertIn("Bill asks:", text)
+        self.assertIn("Tom commitments:", text)
+        self.assertIn("Retrieval anchors:", text)
+        self.assertIn("browser", text.lower())
 
     def test_search_memory_returns_match_linked_to_entry_id(self) -> None:
         entry = append_entry(
@@ -463,6 +502,32 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(artifact["artifact_type"], "memory")
         self.assertEqual(artifact["producer"], "agent-v1")
 
+    def test_fetch_entry_detail_includes_conversation_brief_content(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: what happened on may 7th?\nAssistant: here is the rundown.",
+                "created_at": "2026-05-23T11:00:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "Bill asks for a May 7 rundown and Tom responds with a concise recap.",
+                "created_at": "2026-05-23T11:01:00+00:00",
+            },
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        brief = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "conversation-brief"][0]
+        self.assertIn("May 7 rundown", brief["content"])
+
     def test_fetch_entry_detail_includes_open_loop_payload_for_analysis_artifact(self) -> None:
         e1 = append_entry(
             self.paths,
@@ -491,6 +556,52 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertGreaterEqual(len(open_loop_artifacts), 1)
         self.assertIn("open_loops", open_loop_artifacts[0])
         self.assertIsInstance(open_loop_artifacts[0]["open_loops"], list)
+
+    def test_produce_conversation_briefs_attaches_brief_and_list_entries_surfaces_it(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now."
+                ),
+                "created_at": "2026-05-23T12:00:00+00:00",
+            },
+        )
+        produced = produce_conversation_briefs(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(produced["produced_count"], 1)
+
+        listed = list_entries(self.paths, {"limit": 5, "offset": 0})
+        item = [item for item in listed["items"] if item["entry_id"] == entry["entry_id"]][0]
+        self.assertTrue(item["brief"])
+        self.assertIn("Bill", item["brief"])
+
+    def test_produce_compressed_memory_indexes_artifact_and_search_hits_compressed_layer(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": (
+                    "Willardmechem: what happened on may 7th?\n"
+                    "Assistant: I checked the May 7 entry and found the microcontractor and reMarkable discussion."
+                ),
+                "created_at": "2026-05-23T12:00:00+00:00",
+            },
+        )
+        produced = produce_compressed_memory(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(produced["produced_count"], 1)
+        self.assertTrue(produced["produced"][0]["indexed_in_memory"])
+
+        results = search_memory(self.paths, {"query": "May 7 microcontractor", "limit": 5})
+        self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
+        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
+        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
 
     def test_produce_open_loops_emits_analysis_artifact(self) -> None:
         append_entry(
@@ -728,8 +839,8 @@ class AppendEntrySliceTests(unittest.TestCase):
             source="telegram-direct-import",
             gap_minutes=30,
             max_chars=4000,
-            min_messages_before_gap_split=1,
-            min_chars_before_gap_split=1,
+            min_messages_before_gap_split=0,
+            min_chars_before_gap_split=0,
         )
 
         self.assertEqual(result["message_count"], 3)
@@ -768,74 +879,121 @@ class AppendEntrySliceTests(unittest.TestCase):
         )
         self.assertEqual(len(built), 2)
 
-    def test_build_session_entries_short_contiguous_exchange_stays_one_chunk(self) -> None:
-        messages = [
-            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Hi", {}),
-            TranscriptMessage("2", "2026-05-25T10:01:00+00:00", "agent", "Tom", "Hello", {}),
-            TranscriptMessage("3", "2026-05-25T10:02:00+00:00", "human", "Bill", "Need quick help", {}),
-        ]
-        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
-        self.assertEqual(len(built), 1)
-        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2", "3"])
-
-    def test_build_session_entries_long_gap_unrelated_restart_splits(self) -> None:
-        messages = [
-            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Can you send the deployment notes?", {}),
-            TranscriptMessage("2", "2026-05-25T12:00:00+00:00", "human", "Bill", "Different topic: lunch tomorrow?", {}),
-        ]
-        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
-        self.assertEqual(len(built), 2)
-
-    def test_build_session_entries_long_gap_obvious_continuation_stays_together(self) -> None:
-        messages = [
-            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Can you send the deployment notes?", {}),
-            TranscriptMessage("2", "2026-05-25T12:00:00+00:00", "agent", "Tom", "Done, sent now.", {}),
-        ]
-        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
-        self.assertEqual(len(built), 1)
-        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2"])
-
-    def test_build_session_entries_long_gap_same_task_groups_more_aggressively(self) -> None:
-        messages = [
-            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "Need a codex build fix for android release pipeline.", {}),
-            TranscriptMessage("2", "2026-05-25T10:05:00+00:00", "agent", "Tom", "I can work that build issue.", {}),
-            TranscriptMessage("3", "2026-05-25T11:20:00+00:00", "human", "Bill", "The android build fix still matters; let's continue that pipeline task.", {}),
-        ]
-        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
-        self.assertEqual(len(built), 1)
-        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2", "3"])
-
     def test_build_session_entries_splits_on_max_messages(self) -> None:
         messages = [
-            TranscriptMessage("1", "2026-05-25T10:00:00+00:00", "human", "Bill", "one", {}),
-            TranscriptMessage("2", "2026-05-25T10:01:00+00:00", "agent", "Tom", "two", {}),
-            TranscriptMessage("3", "2026-05-25T10:02:00+00:00", "human", "Bill", "three", {}),
+            TranscriptMessage(
+                message_id=str(idx),
+                created_at=f"2026-05-25T10:0{idx}:00+00:00",
+                author_role="human" if idx % 2 else "agent",
+                speaker="Bill" if idx % 2 else "Tom",
+                content=f"Message {idx}",
+                metadata={},
+            )
+            for idx in range(1, 4)
         ]
-        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=2)
+        built = build_session_entries(
+            messages,
+            source="telegram-direct-import",
+            gap_minutes=60,
+            max_chars=6000,
+            max_messages=2,
+        )
         self.assertEqual(len(built), 2)
         self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1", "2"])
         self.assertEqual(built[1]["metadata"]["source_message_ids"], ["3"])
 
-    def test_build_session_entries_session_or_conversation_change_forces_split(self) -> None:
+    def test_build_session_entries_keeps_small_long_gap_chunk_together(self) -> None:
         messages = [
             TranscriptMessage(
-                "1",
-                "2026-05-25T10:00:00+00:00",
-                "human",
-                "Bill",
-                "first",
-                {"source_session_id": "s1", "source_conversation_id": "c1"},
+                message_id="1",
+                created_at="2026-05-25T10:00:00+00:00",
+                author_role="human",
+                speaker="Bill",
+                content="Can you check the browser on my Mac?",
+                metadata={"source_session_id": "s1", "source_conversation_id": "c1"},
             ),
             TranscriptMessage(
-                "2",
-                "2026-05-25T10:01:00+00:00",
-                "agent",
-                "Tom",
-                "second",
-                {"source_session_id": "s1", "source_conversation_id": "c2"},
+                message_id="2",
+                created_at="2026-05-25T11:15:00+00:00",
+                author_role="agent",
+                speaker="Tom",
+                content="Yes, I found the issue and fixed it.",
+                metadata={"source_session_id": "s1", "source_conversation_id": "c1", "source_parent_id": "1"},
             ),
         ]
-        built = build_session_entries(messages, source="telegram-direct-import", gap_minutes=30, max_chars=4000, max_messages=40)
+        built = build_session_entries(
+            messages,
+            source="telegram-direct-import",
+            gap_minutes=60,
+            max_chars=6000,
+            max_messages=80,
+        )
+        self.assertEqual(len(built), 1)
+
+    def test_build_session_entries_splits_on_unrelated_long_gap_restart(self) -> None:
+        messages = [
+            TranscriptMessage(
+                message_id="1",
+                created_at="2026-05-25T10:00:00+00:00",
+                author_role="human",
+                speaker="Bill",
+                content="Can you check the browser on my Mac?",
+                metadata={"source_session_id": "s1", "source_conversation_id": "c1"},
+            ),
+            TranscriptMessage(
+                message_id="2",
+                created_at="2026-05-25T11:15:00+00:00",
+                author_role="human",
+                speaker="Bill",
+                content="Different topic: what happened with the Play Console build?",
+                metadata={"source_session_id": "s1", "source_conversation_id": "c1"},
+            ),
+            TranscriptMessage(
+                message_id="3",
+                created_at="2026-05-25T11:16:00+00:00",
+                author_role="agent",
+                speaker="Tom",
+                content="It still needs the review-mode package.",
+                metadata={"source_session_id": "s1", "source_conversation_id": "c1"},
+            ),
+        ]
+        built = build_session_entries(
+            messages,
+            source="telegram-direct-import",
+            gap_minutes=60,
+            max_chars=6000,
+            max_messages=80,
+        )
+        self.assertEqual(len(built), 2)
+        self.assertEqual(built[0]["metadata"]["source_message_ids"], ["1"])
+        self.assertEqual(built[1]["metadata"]["source_message_ids"], ["2", "3"])
+
+    def test_build_session_entries_splits_on_source_conversation_change(self) -> None:
+        messages = [
+            TranscriptMessage(
+                message_id="1",
+                created_at="2026-05-25T10:00:00+00:00",
+                author_role="human",
+                speaker="Bill",
+                content="First thread",
+                metadata={"source_session_id": "s1", "source_conversation_id": "c1"},
+            ),
+            TranscriptMessage(
+                message_id="2",
+                created_at="2026-05-25T10:01:00+00:00",
+                author_role="agent",
+                speaker="Tom",
+                content="Second thread",
+                metadata={"source_session_id": "s1", "source_conversation_id": "c2"},
+            ),
+        ]
+        built = build_session_entries(
+            messages,
+            source="telegram-direct-import",
+            gap_minutes=60,
+            max_chars=6000,
+            max_messages=80,
+        )
         self.assertEqual(len(built), 2)
         self.assertEqual(built[0]["metadata"]["source_conversation_id"], "c1")
         self.assertEqual(built[1]["metadata"]["source_conversation_id"], "c2")
@@ -1000,6 +1158,214 @@ class AppendEntrySliceTests(unittest.TestCase):
                 output_path=self.root / "unused-telegram.jsonl",
                 format_name="openclaw-telegram-jsonl",
             )
+
+    def test_build_openclaw_telegram_direct_transcript_combines_inbound_and_sent_messages(self) -> None:
+        inbound = self.root / "telegram-messages.json"
+        inbound.write_text(
+            json.dumps(
+                {
+                    "key": "default:713733361:7001",
+                    "node": {
+                        "sourceMessage": {
+                            "message_id": 7001,
+                            "from": {"id": 713733361, "is_bot": False, "username": "Willardmechem"},
+                            "chat": {"id": 713733361, "type": "private"},
+                            "date": 1778925595,
+                            "text": "hello tom",
+                        }
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sessions_root = self.root / "sessions"
+        sessions_root.mkdir()
+        session_file = sessions_root / "run-1.jsonl"
+        session_file.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session", "id": "sess-1", "timestamp": "2026-05-16T10:00:00Z", "cwd": "/tmp"}),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-record",
+                            "parentId": "prev",
+                            "timestamp": "2026-05-16T10:00:10Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-1",
+                                        "name": "message",
+                                        "arguments": {"action": "send", "message": "hi bill"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-record",
+                            "parentId": "assistant-call-record",
+                            "timestamp": "2026-05-16T10:00:11Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-1",
+                                "toolName": "message",
+                                "content": [
+                                    {
+                                        "type": "toolResult",
+                                        "content": json.dumps({"ok": True, "messageId": "7002", "chatId": "713733361"}),
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_path = self.root / "telegram-direct-transcript.jsonl"
+        result = build_openclaw_telegram_direct_transcript(
+            inbound_path=inbound,
+            sessions_root=sessions_root,
+            output_path=out_path,
+            chat_id="713733361",
+        )
+        self.assertEqual(result["message_count"], 2)
+        self.assertEqual(result["inbound_count"], 1)
+        self.assertEqual(result["outbound_count"], 1)
+        rows = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(rows[0]["message_id"], "7001")
+        self.assertEqual(rows[0]["author_role"], "human")
+        self.assertEqual(rows[1]["message_id"], "7002")
+        self.assertEqual(rows[1]["author_role"], "agent")
+        self.assertEqual(rows[1]["content"], "hi bill")
+        self.assertEqual(rows[1]["metadata"]["telegram_direction"], "outbound")
+        self.assertEqual(rows[1]["metadata"]["source_runtime_tool_call_id"], "tool-call-1")
+
+    def test_build_openclaw_telegram_direct_transcript_drops_outbound_before_inbound_window(self) -> None:
+        inbound = self.root / "telegram-messages-window.json"
+        inbound.write_text(
+            json.dumps(
+                {
+                    "key": "default:713733361:7001",
+                    "node": {
+                        "sourceMessage": {
+                            "message_id": 7001,
+                            "from": {"id": 713733361, "is_bot": False, "username": "Willardmechem"},
+                            "chat": {"id": 713733361, "type": "private"},
+                            "date": 1778925595,
+                            "text": "hello tom",
+                        }
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sessions_root = self.root / "sessions-window"
+        sessions_root.mkdir()
+        session_file = sessions_root / "run-1.jsonl"
+        session_file.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session", "id": "sess-1", "timestamp": "2026-05-16T09:00:00Z", "cwd": "/tmp"}),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-record-early",
+                            "parentId": "prev",
+                            "timestamp": "2026-05-16T08:59:10Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-early",
+                                        "name": "message",
+                                        "arguments": {"action": "send", "message": "old reply"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-record-early",
+                            "parentId": "assistant-call-record-early",
+                            "timestamp": "2026-05-16T08:59:11Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-early",
+                                "toolName": "message",
+                                "content": [
+                                    {
+                                        "type": "toolResult",
+                                        "content": json.dumps({"ok": True, "messageId": "6999", "chatId": "713733361"}),
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-record-current",
+                            "parentId": "prev",
+                            "timestamp": "2026-05-16T10:00:10Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-current",
+                                        "name": "message",
+                                        "arguments": {"action": "send", "message": "current reply"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-record-current",
+                            "parentId": "assistant-call-record-current",
+                            "timestamp": "2026-05-16T10:00:11Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-current",
+                                "toolName": "message",
+                                "content": [
+                                    {
+                                        "type": "toolResult",
+                                        "content": json.dumps({"ok": True, "messageId": "7002", "chatId": "713733361"}),
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        out_path = self.root / "telegram-direct-transcript-window.jsonl"
+        result = build_openclaw_telegram_direct_transcript(
+            inbound_path=inbound,
+            sessions_root=sessions_root,
+            output_path=out_path,
+            chat_id="713733361",
+        )
+        self.assertEqual(result["message_count"], 2)
+        rows = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual([row["message_id"] for row in rows], ["7001", "7002"])
 
     def test_build_transcript_jsonl_openclaw_session_jsonl_maps_user_and_assistant_text(self) -> None:
         source_file = self.root / "session-log.jsonl"
@@ -1495,6 +1861,151 @@ class AppendEntrySliceTests(unittest.TestCase):
         result = list_imports(self.paths, {"limit": 1})
         self.assertEqual(result["count"], 1)
         self.assertEqual(len(result["items"]), 1)
+
+    def test_adapt_openclaw_session_jsonl_skips_synthetic_cron_prompt(self) -> None:
+        session_path = self.root / "cronish.jsonl"
+        output_path = self.root / "transcript.jsonl"
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session", "id": "sess-1", "timestamp": "2026-05-22T07:00:00Z", "cwd": "/tmp"}),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "m1",
+                            "parentId": None,
+                            "timestamp": "2026-05-22T07:00:00Z",
+                            "message": {"role": "user", "content": "[cron:abc] Do a thing"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "m2",
+                            "parentId": "m1",
+                            "timestamp": "2026-05-22T07:00:05Z",
+                            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = adapt_session_export(
+            input_path=session_path,
+            output_path=output_path,
+            format_name="openclaw-session-jsonl",
+        )
+
+        self.assertEqual(result["message_count"], 1)
+        rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(rows[0]["author_role"], "agent")
+        self.assertEqual(rows[0]["content"], "Done")
+
+    def test_discover_openclaw_session_files_filters_by_session_key_and_time(self) -> None:
+        trajectories = self.root / "trajectories"
+        trajectories.mkdir(parents=True, exist_ok=True)
+        (trajectories / "a.trajectory.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "session.started",
+                    "ts": "2026-05-20T07:15:07.786Z",
+                    "sessionId": "run-a",
+                    "sessionKey": "agent:main:telegram:default:direct:713733361",
+                    "data": {"sessionFile": str(self.root / "a.jsonl"), "threadId": "thread-a"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (trajectories / "b.trajectory.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "session.started",
+                    "ts": "2026-05-10T07:15:07.786Z",
+                    "sessionId": "run-b",
+                    "sessionKey": "agent:main:telegram:default:direct:other",
+                    "data": {"sessionFile": str(self.root / "b.jsonl"), "threadId": "thread-b"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        discovered = discover_openclaw_session_files(
+            trajectories_root=trajectories,
+            session_key="agent:main:telegram:default:direct:713733361",
+            since=datetime.fromisoformat("2026-05-19T00:00:00+00:00"),
+            until=datetime.fromisoformat("2026-05-21T00:00:00+00:00"),
+        )
+
+        self.assertEqual(len(discovered), 1)
+        self.assertEqual(discovered[0]["session_id"], "run-a")
+        self.assertEqual(discovered[0]["thread_id"], "thread-a")
+
+    def test_backfill_openclaw_session_key_dry_run_imports_matching_files(self) -> None:
+        trajectories = self.root / "trajectories"
+        trajectories.mkdir(parents=True, exist_ok=True)
+        session_path = self.root / "turn-a.jsonl"
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session", "id": "sess-a", "timestamp": "2026-05-20T07:15:07.786Z", "cwd": "/tmp"}),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "u1",
+                            "parentId": None,
+                            "timestamp": "2026-05-20T07:15:08Z",
+                            "message": {"role": "user", "content": "What happened on May 7th?"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "a1",
+                            "parentId": "u1",
+                            "timestamp": "2026-05-20T07:15:10Z",
+                            "message": {"role": "assistant", "content": [{"type": "text", "text": "Here is the rundown."}]},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (trajectories / "turn-a.trajectory.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "session.started",
+                    "ts": "2026-05-20T07:15:07.786Z",
+                    "sessionId": "run-a",
+                    "sessionKey": "agent:main:telegram:default:direct:713733361",
+                    "data": {"sessionFile": str(session_path), "threadId": "thread-a"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out = backfill_openclaw_session_key(
+            self.paths,
+            trajectories_root=trajectories,
+            session_key="agent:main:telegram:default:direct:713733361",
+            source="telegram-direct-bootstrap",
+            since="2026-05-19",
+            until="2026-05-21",
+            dry_run=True,
+        )
+
+        self.assertEqual(out["discovered_session_file_count"], 1)
+        self.assertEqual(out["processed_session_file_count"], 1)
+        self.assertEqual(out["transcript_message_count"], 2)
+        self.assertEqual(out["session_chunk_count"], 1)
+        self.assertEqual(out["imported_count"], 1)
+        self.assertEqual(out["skipped_duplicate_count"], 0)
 
     def _write_session_import_fixture(self, filename: str, source_message_id: str) -> Path:
         source_file = self.root / filename

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 from typing import Any
@@ -120,3 +121,187 @@ def import_openclaw_session(
         "import_result": import_result,
     }
     return summary
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _coerce_since(value: str | None) -> datetime | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    if len(raw) == 10:
+        return datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+    dt = _parse_iso_datetime(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _coerce_until(value: str | None) -> datetime | None:
+    if value in (None, ""):
+        return None
+    raw = str(value).strip()
+    if len(raw) == 10:
+        return datetime.fromisoformat(raw).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    dt = _parse_iso_datetime(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def discover_openclaw_session_files(
+    *,
+    trajectories_root: Path,
+    session_key: str,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    seen_files: set[str] = set()
+    for path in sorted(trajectories_root.glob("*.trajectory.jsonl")):
+        session_started: dict[str, Any] | None = None
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                obj = json.loads(raw)
+                if not isinstance(obj, dict):
+                    raise ValueError(f"{path}: line {line_number}: trajectory record must be an object")
+                if obj.get("type") == "session.started":
+                    session_started = obj
+                    break
+        if session_started is None:
+            continue
+        if session_started.get("sessionKey") != session_key:
+            continue
+
+        started_at_raw = session_started.get("ts")
+        if started_at_raw in (None, ""):
+            continue
+        started_at = _parse_iso_datetime(str(started_at_raw)).astimezone(timezone.utc)
+        if since and started_at < since:
+            continue
+        if until and started_at >= until:
+            continue
+
+        data = session_started.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        session_file_raw = data.get("sessionFile")
+        if session_file_raw in (None, ""):
+            continue
+        session_file = str(Path(str(session_file_raw)).expanduser().resolve())
+        if session_file in seen_files:
+            continue
+        seen_files.add(session_file)
+        items.append(
+            {
+                "session_key": session_key,
+                "started_at": started_at.isoformat(),
+                "trajectory_path": str(path.resolve()),
+                "session_id": session_started.get("sessionId"),
+                "session_file": session_file,
+                "thread_id": data.get("threadId"),
+            }
+        )
+
+    items.sort(key=lambda item: (item["started_at"], item["session_file"]))
+    return items
+
+
+def backfill_openclaw_session_key(
+    paths: Paths,
+    *,
+    trajectories_root: Path,
+    session_key: str,
+    source: str = "openclaw-session-backfill",
+    since: str | None = None,
+    until: str | None = None,
+    days_back: int | None = None,
+    dry_run: bool = False,
+    gap_minutes: int = 60,
+    max_chars: int = 6000,
+    max_messages: int = 80,
+    min_messages_before_gap_split: int = 4,
+    min_chars_before_gap_split: int = 400,
+) -> dict[str, Any]:
+    if days_back is not None and days_back < 1:
+        raise ValueError("days_back must be >= 1")
+    since_dt = _coerce_since(since)
+    until_dt = _coerce_until(until)
+    if days_back is not None and since_dt is None:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=days_back)
+    if since_dt and until_dt and since_dt >= until_dt:
+        raise ValueError("since must be earlier than until")
+
+    trajectories_root = Path(trajectories_root).expanduser().resolve()
+    discovered = discover_openclaw_session_files(
+        trajectories_root=trajectories_root,
+        session_key=session_key,
+        since=since_dt,
+        until=until_dt,
+    )
+
+    results: list[dict[str, Any]] = []
+    total_transcript_messages = 0
+    total_session_chunks = 0
+    total_imported = 0
+    total_skipped = 0
+    missing_files: list[str] = []
+
+    for item in discovered:
+        input_path = Path(item["session_file"])
+        if not input_path.exists():
+            missing_files.append(str(input_path))
+            continue
+        imported = import_openclaw_session(
+            paths,
+            input_path=input_path,
+            source=source,
+            dry_run=dry_run,
+            gap_minutes=gap_minutes,
+            max_chars=max_chars,
+            max_messages=max_messages,
+            min_messages_before_gap_split=min_messages_before_gap_split,
+            min_chars_before_gap_split=min_chars_before_gap_split,
+        )
+        total_transcript_messages += int(imported.get("transcript_message_count", 0))
+        total_session_chunks += int(imported.get("session_chunk_count", 0))
+        total_imported += int(imported.get("imported_count", 0))
+        total_skipped += int(imported.get("skipped_duplicate_count", 0))
+        results.append(
+            {
+                "started_at": item["started_at"],
+                "session_file": item["session_file"],
+                "trajectory_path": item["trajectory_path"],
+                "session_id": item.get("session_id"),
+                "thread_id": item.get("thread_id"),
+                "transcript_message_count": imported.get("transcript_message_count", 0),
+                "session_chunk_count": imported.get("session_chunk_count", 0),
+                "imported_count": imported.get("imported_count", 0),
+                "skipped_duplicate_count": imported.get("skipped_duplicate_count", 0),
+                "import_id": imported.get("import_id"),
+                "batch_manifest_path": imported.get("batch_manifest_path"),
+            }
+        )
+
+    return {
+        "session_key": session_key,
+        "source": source,
+        "trajectories_root": str(trajectories_root),
+        "since": since_dt.isoformat() if since_dt else None,
+        "until": until_dt.isoformat() if until_dt else None,
+        "days_back": days_back,
+        "dry_run": dry_run,
+        "discovered_session_file_count": len(discovered),
+        "processed_session_file_count": len(results),
+        "missing_session_files": missing_files,
+        "transcript_message_count": total_transcript_messages,
+        "session_chunk_count": total_session_chunks,
+        "imported_count": total_imported,
+        "skipped_duplicate_count": total_skipped,
+        "items": results,
+    }

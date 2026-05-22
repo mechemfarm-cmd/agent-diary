@@ -21,6 +21,13 @@ SUPPORTED_ADAPTER_FORMATS = [
     "openclaw-session-jsonl",
 ]
 
+OPENCLAW_SYNTHETIC_PROMPT_PREFIXES = (
+    "[cron:",
+    "[heartbeat",
+    "[wake:",
+    "[system:",
+)
+
 
 def _normalize_author_role(value: str) -> str:
     role = value.strip().lower()
@@ -60,6 +67,19 @@ def _iso_from_unix_seconds(value: Any, *, line_hint: str) -> str:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{line_hint}: invalid unix timestamp") from exc
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(value: str, *, line_hint: str) -> datetime:
+    text = _non_empty_str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{line_hint}: invalid ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _non_empty_str(value: Any) -> str:
@@ -136,6 +156,11 @@ def _extract_text_chunks(value: Any) -> list[str]:
     return chunks
 
 
+def _is_synthetic_openclaw_prompt(text: str) -> bool:
+    lowered = text.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in OPENCLAW_SYNTHETIC_PROMPT_PREFIXES)
+
+
 def _load_openclaw_session_jsonl(path: Path) -> tuple[list[dict[str, Any]], str | None, str | None]:
     rows: list[dict[str, Any]] = []
     session_id: str | None = None
@@ -197,10 +222,13 @@ def _load_openclaw_session_jsonl(path: Path) -> tuple[list[dict[str, Any]], str 
 
             if role == "user":
                 content = message.get("content")
-                if not isinstance(content, str):
-                    raise ValueError(f"line {line_number}: user message content must be a string")
-                text = content.strip()
+                if isinstance(content, str):
+                    text = content.strip()
+                else:
+                    text = "\n".join(_extract_text_chunks(content)).strip()
                 if not text:
+                    continue
+                if _is_synthetic_openclaw_prompt(text):
                     continue
                 speaker = _normalize_speaker({"speaker": "User"}, "human")
                 rows.append(
@@ -353,9 +381,234 @@ def _load_openclaw_telegram_jsonl(path: Path) -> tuple[list[dict[str, Any]], str
             )
     if inferred_session and inferred_conversation is None:
         inferred_conversation = f"openclaw:{inferred_session}"
-    elif inferred_conversation is None and session_cwd:
-        inferred_conversation = session_cwd
     return rows, inferred_session, inferred_conversation
+
+
+def _parse_tool_result_payload(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _assistant_sent_messages_from_session_files(*, sessions_root: Path, chat_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(sessions_root.glob("*.jsonl")):
+        pending: dict[str, dict[str, Any]] = {}
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                obj = json.loads(raw)
+                if not isinstance(obj, dict) or obj.get("type") != "message":
+                    continue
+                message = obj.get("message")
+                if not isinstance(message, dict):
+                    continue
+                role = message.get("role")
+                if role == "assistant":
+                    content = message.get("content")
+                    if not isinstance(content, list):
+                        continue
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") != "toolCall" or item.get("name") != "message":
+                            continue
+                        arguments = item.get("arguments")
+                        if not isinstance(arguments, dict):
+                            arguments = item.get("input")
+                        if not isinstance(arguments, dict):
+                            continue
+                        if arguments.get("action") != "send":
+                            continue
+                        text = arguments.get("message")
+                        tool_call_id = item.get("id")
+                        if text in (None, "") or tool_call_id in (None, ""):
+                            continue
+                        pending[str(tool_call_id)] = {
+                            "message": _non_empty_str(text),
+                            "call_timestamp": _non_empty_str(obj.get("timestamp") or message.get("timestamp")),
+                            "runtime_record_id": _non_empty_str(obj.get("id")),
+                            "session_file": str(path.resolve()),
+                        }
+                    continue
+
+                if role != "toolResult":
+                    continue
+                if message.get("toolName") != "message":
+                    continue
+                tool_call_id = message.get("toolCallId")
+                if tool_call_id in (None, ""):
+                    continue
+                pending_item = pending.get(str(tool_call_id))
+                if pending_item is None:
+                    continue
+                content = message.get("content")
+                payload: dict[str, Any] | None = None
+                if isinstance(content, list):
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        payload = _parse_tool_result_payload(item.get("content")) or _parse_tool_result_payload(item.get("text"))
+                        if payload is not None:
+                            break
+                if payload is None:
+                    continue
+                payload_chat_id = payload.get("chatId")
+                payload_message_id = payload.get("messageId")
+                if payload_chat_id is None or payload_message_id in (None, ""):
+                    continue
+                if str(payload_chat_id) != str(chat_id):
+                    continue
+                created_at = _non_empty_str(obj.get("timestamp") or message.get("timestamp"))
+                rows.append(
+                    {
+                        "line_hint": f"{path.name}:line {line_number}",
+                        "message": {
+                            "message_id": _non_empty_str(payload_message_id),
+                            "created_at": created_at,
+                            "author_role": "agent",
+                            "speaker": "Assistant",
+                            "content": pending_item["message"],
+                            "metadata": {
+                                "transport": "telegram",
+                                "telegram_chat_id": payload_chat_id,
+                                "telegram_direction": "outbound",
+                                "source_message_id": _non_empty_str(payload_message_id),
+                                "source_runtime_tool_call_id": str(tool_call_id),
+                                "source_runtime_record_id": pending_item["runtime_record_id"],
+                                "source_runtime_session_file": pending_item["session_file"],
+                                "source_runtime_call_timestamp": pending_item["call_timestamp"],
+                            },
+                        },
+                    }
+                )
+                pending.pop(str(tool_call_id), None)
+    return rows
+
+
+def build_openclaw_telegram_direct_transcript(
+    *,
+    inbound_path: Path,
+    sessions_root: Path,
+    output_path: Path,
+    chat_id: str,
+    source_session_id: str | None = None,
+    source_conversation_id: str | None = None,
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    first_inbound_at: datetime | None = None
+    with inbound_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            outer = json.loads(raw)
+            if not isinstance(outer, dict):
+                raise ValueError(f"line {line_number}: telegram record must be an object")
+            node = outer.get("node", {})
+            if not isinstance(node, dict):
+                raise ValueError(f"line {line_number}: node must be an object")
+            source_message = node.get("sourceMessage")
+            if not isinstance(source_message, dict):
+                raise ValueError(f"line {line_number}: missing node.sourceMessage object")
+            chat = source_message.get("chat", {})
+            chat_value = chat.get("id") if isinstance(chat, dict) else None
+            if str(chat_value) != str(chat_id):
+                continue
+            role = _author_role_from_telegram_message(source_message)
+            speaker = _speaker_from_telegram_message(source_message, role)
+            content = _require_content(source_message, line_hint=f"line {line_number}")
+            created_at = _iso_from_unix_seconds(source_message.get("date"), line_hint=f"line {line_number}")
+            created_at_dt = _parse_iso_datetime(created_at, line_hint=f"line {line_number}")
+            message_id = _non_empty_str(source_message.get("message_id"))
+            metadata = {
+                "transport": "telegram",
+                "telegram_direction": "inbound",
+                "source_message_id": message_id,
+                "source_key": outer.get("key"),
+                "telegram_chat_id": chat_value,
+                "telegram_from_id": source_message.get("from", {}).get("id") if isinstance(source_message.get("from"), dict) else None,
+                "telegram_username": source_message.get("from", {}).get("username") if isinstance(source_message.get("from"), dict) else None,
+                "is_bot": source_message.get("from", {}).get("is_bot") if isinstance(source_message.get("from"), dict) else None,
+            }
+            metadata = {k: v for k, v in metadata.items() if v not in (None, "")}
+            rows.append(
+                {
+                    "line_hint": f"line {line_number}",
+                    "message": {
+                        "message_id": message_id,
+                        "created_at": created_at,
+                        "author_role": role,
+                        "speaker": speaker,
+                        "content": content,
+                        "metadata": metadata,
+                    },
+                }
+            )
+            if first_inbound_at is None or created_at_dt < first_inbound_at:
+                first_inbound_at = created_at_dt
+
+    outbound_rows = _assistant_sent_messages_from_session_files(sessions_root=sessions_root, chat_id=chat_id)
+    if first_inbound_at is not None:
+        filtered_outbound_rows: list[dict[str, Any]] = []
+        for row in outbound_rows:
+            outbound_at = _parse_iso_datetime(
+                row["message"]["created_at"],
+                line_hint=row["line_hint"],
+            )
+            if outbound_at < first_inbound_at:
+                continue
+            filtered_outbound_rows.append(row)
+        outbound_rows = filtered_outbound_rows
+    rows.extend(outbound_rows)
+    effective_session_id = source_session_id or f"telegram-direct:{chat_id}"
+    effective_conversation_id = source_conversation_id or f"telegram:{chat_id}"
+    messages: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for row in rows:
+        normalized = _normalize_message(
+            row["message"],
+            line_hint=row["line_hint"],
+            source_session_id=effective_session_id,
+            source_conversation_id=effective_conversation_id,
+        )
+        dedupe_key = f'{normalized["author_role"]}:{normalized["message_id"]}'
+        if dedupe_key in seen_ids:
+            continue
+        seen_ids.add(dedupe_key)
+        messages.append(normalized)
+    messages.sort(key=lambda item: (item["created_at"], item["message_id"], item["author_role"]))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for message in messages:
+            handle.write(json.dumps(message, ensure_ascii=False))
+            handle.write("\n")
+    inbound_count = sum(1 for message in messages if message["metadata"].get("telegram_direction") == "inbound")
+    outbound_count = sum(1 for message in messages if message["metadata"].get("telegram_direction") == "outbound")
+    return {
+        "input_path": str(inbound_path),
+        "sessions_root": str(sessions_root),
+        "output_path": str(output_path),
+        "format": "openclaw-telegram-direct",
+        "message_count": len(messages),
+        "inbound_count": inbound_count,
+        "outbound_count": outbound_count,
+        "schema_fields": CANONICAL_TRANSCRIPT_FIELDS,
+        "source_session_id": effective_session_id,
+        "source_conversation_id": effective_conversation_id,
+        "chat_id": str(chat_id),
+    }
 
 
 def adapt_session_export(
