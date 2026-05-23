@@ -50,6 +50,10 @@ QUESTION_ACTION_HINTS = (
     "decision",
     "deadline",
     "when",
+    "check",
+    "confirm",
+    "verify",
+    "let me know",
 )
 
 NON_ACTIONABLE_HINTS = (
@@ -57,6 +61,20 @@ NON_ACTIONABLE_HINTS = (
     "what do you think",
     "nice to have",
 )
+
+RESOLUTION_RESULT_HINTS = (
+    "is back",
+    "works now",
+    "working now",
+    "confirmed",
+    "checked",
+)
+
+NON_DISTINCTIVE_TOKENS = {
+    "check", "confirm", "verify", "whether", "follow", "next", "pending", "plan",
+    "decision", "deadline", "when", "still", "works", "work", "know", "tell", "update",
+    "great", "please", "could", "would",
+}
 
 
 @dataclass
@@ -87,10 +105,14 @@ def _extract_candidates(entry_id: str, created_at: str, content: str) -> list[Ca
 
     # Keep extraction simple and explicit: split by lines and sentence-ish punctuation.
     parts = re.split(r"[\n\r]+|(?<=[.!?])\s+", content)
+    cleaned_parts: list[str] = []
     for raw in parts:
         text = " ".join(raw.split()).strip()
         if len(text) < 10:
             continue
+        cleaned_parts.append(text)
+
+    for idx, text in enumerate(cleaned_parts):
         lowered = text.lower()
         has_open_hint = any(h in lowered for h in OPEN_HINTS)
         has_should_context = any(h in lowered for h in SHOULD_CONTEXT_HINTS)
@@ -99,8 +121,29 @@ def _extract_candidates(entry_id: str, created_at: str, content: str) -> list[Ca
         has_closed = any(h in lowered for h in CLOSED_HINTS)
         is_non_actionable = any(h in lowered for h in NON_ACTIONABLE_HINTS)
         if has_open and not has_closed and not is_non_actionable:
+            if has_question_action_context and _is_question_addressed_later(text, cleaned_parts[idx + 1 :]):
+                continue
             snippets.append(Candidate(entry_id=entry_id, created_at=created_at, text=text[:220]))
     return snippets
+
+
+def _is_question_addressed_later(question_text: str, later_parts: list[str]) -> bool:
+    q_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9-]{4,}", question_text)
+        if token.lower() not in NON_DISTINCTIVE_TOKENS
+    }
+    if not q_tokens:
+        return False
+    for part in later_parts:
+        lowered = part.lower()
+        has_resolution_signal = any(h in lowered for h in CLOSED_HINTS) or any(h in lowered for h in RESOLUTION_RESULT_HINTS)
+        if not has_resolution_signal:
+            continue
+        part_tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9-]{4,}", part)}
+        if q_tokens.intersection(part_tokens):
+            return True
+    return False
 
 
 def _loop_key(text: str) -> str:

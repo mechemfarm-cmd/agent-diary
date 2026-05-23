@@ -21,6 +21,11 @@ Show per row:
 - `source`
 - `author_role`
 - `preview` (compact raw-entry preview)
+- optional `open_loop` hint when entry participates in unresolved-analysis lineage:
+  - `has_open_loops` (bool)
+  - `count` (int, number of unresolved loops in the latest linked open-loop analysis artifact)
+  - `representative_title` (string|null, one compact unresolved-concern label from the latest linked open-loop analysis artifact)
+  - `last_seen_at` (string|null, ISO-8601 timestamp of the latest linked open-loop analysis artifact)
 
 Visual priority:
 - Primary: diary entry list rows (raw-entry based)
@@ -28,6 +33,9 @@ Visual priority:
 
 Data source:
 - `list_entries(limit, offset)`
+- optional browse focus filter: `list_entries(..., only_with_open_loops=true)` returns only rows participating in open-loop analysis (anchor or lineage-linked)
+  - in this mode, `limit`/`offset` apply to the filtered open-loop-participating result set
+  - in this mode, rows are ordered by `open_loop.last_seen_at` descending (ties: raw `created_at`, then `entry_id`)
 
 ### 2) Entry Detail view
 Primary job: show one authoritative raw entry in full.

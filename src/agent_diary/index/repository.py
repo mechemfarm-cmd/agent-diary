@@ -59,6 +59,18 @@ def search_memory(db_path: Path, query: str, limit: int = 20) -> list[dict[str, 
               mi.memory_text AS match_text
             FROM memory_index mi
             WHERE {where_clause}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM memory_index newer
+                WHERE newer.entry_id = mi.entry_id
+                  AND (
+                    newer.created_at > mi.created_at
+                    OR (
+                      newer.created_at = mi.created_at
+                      AND COALESCE(newer.artifact_id, '') > COALESCE(mi.artifact_id, '')
+                    )
+                  )
+              )
             ORDER BY mi.created_at DESC
             LIMIT ?
             """,

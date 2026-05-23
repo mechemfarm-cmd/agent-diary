@@ -110,3 +110,17 @@ def list_import_batch_manifests(paths: Paths, limit: int = 20) -> list[dict[str,
         if len(manifests) >= limit:
             break
     return manifests
+
+
+def load_import_batch_manifest(paths: Paths, import_id: str) -> dict[str, Any]:
+    ensure_import_dirs(paths)
+    normalized = str(import_id).strip()
+    if not normalized:
+        raise ValueError("import_id is required")
+    path = paths.imports_dir / BATCHES_DIR / f"{normalized}.json"
+    if not path.exists():
+        raise FileNotFoundError(f"import batch manifest not found: {normalized}")
+    body = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(body, dict):
+        raise ValueError(f"import batch manifest is malformed: {normalized}")
+    return body

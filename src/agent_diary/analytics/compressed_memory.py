@@ -13,6 +13,13 @@ STOPWORDS = {
     "them", "what", "when", "where", "will", "would", "could", "should", "about", "there", "here", "their",
     "were", "been", "being", "also", "than", "them", "our", "you", "are", "but", "not", "too", "can", "let",
     "know", "looks", "look", "said", "just", "still", "more", "like", "need",
+    "assistant", "willardmechem",
+}
+WEAK_PHRASE_TOKENS = {
+    "check", "verify", "confirm", "whether", "great", "works", "still", "route", "back",
+}
+WEAK_UNIGRAM_TOKENS = {
+    "check", "great", "verify", "confirm", "whether", "works", "still",
 }
 
 DECISION_CUES = ("let's", "lets", "we should", "we will", "plan", "the plan", "decision", "agreed")
@@ -93,23 +100,63 @@ def _speaker_label(speaker: str) -> str:
 
 
 def _extract_keywords(text: str, limit: int = 8) -> list[str]:
-    tokens = [token.lower() for token in re.findall(r"[a-z0-9]{4,}", text)]
+    words = [token.lower() for token in re.findall(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", text)]
     counts: dict[str, int] = {}
-    for token in tokens:
-        if token in STOPWORDS:
+    for token in words:
+        if token in STOPWORDS or token in WEAK_UNIGRAM_TOKENS or len(token) < 4:
             continue
         counts[token] = counts.get(token, 0) + 1
-    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    return [token for token, _ in ranked[:limit]]
+
+    phrase_counts: dict[str, int] = {}
+    for i in range(len(words) - 1):
+        first = words[i]
+        second = words[i + 1]
+        if (
+            first in STOPWORDS
+            or second in STOPWORDS
+            or len(first) < 4
+            or len(second) < 4
+        ):
+            continue
+        if first in WEAK_PHRASE_TOKENS and second in WEAK_PHRASE_TOKENS:
+            continue
+        has_distinctive_signal = (
+            "-" in first
+            or "-" in second
+            or counts.get(first, 0) >= 2
+            or counts.get(second, 0) >= 2
+        )
+        if not has_distinctive_signal and (first in WEAK_PHRASE_TOKENS or second in WEAK_PHRASE_TOKENS):
+            continue
+        phrase = f"{first} {second}"
+        phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
+
+    anchors: list[str] = []
+    top_phrases = sorted(phrase_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+    anchors.extend(phrase for phrase, _ in top_phrases)
+    covered_unigrams = {token for phrase, _ in top_phrases for token in phrase.split(" ")}
+    top_tokens = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    for token, _ in top_tokens:
+        if token in covered_unigrams:
+            continue
+        if token not in anchors:
+            anchors.append(token)
+        if len(anchors) >= limit:
+            break
+    return anchors[:limit]
 
 
 def _first_matching(turns: list[str], cues: tuple[str, ...], *, limit: int = 140) -> list[str]:
     matched: list[str] = []
     for body in turns:
-        lowered = body.lower()
-        if any(cue in lowered for cue in cues):
+        if _has_cue(body, cues):
             matched.append(_sentenceish(body, limit=limit))
     return matched[:2]
+
+
+def _has_cue(text: str, cues: tuple[str, ...]) -> bool:
+    lowered = text.lower().replace("’", "'").replace("`", "'")
+    return any(cue in lowered for cue in cues)
 
 
 def build_compressed_memory_text(entry: dict[str, Any]) -> str:
@@ -131,12 +178,25 @@ def build_compressed_memory_text(entry: dict[str, Any]) -> str:
             lines.append(f"Retrieval anchors: {', '.join(keywords)}")
         return "\n".join(lines)
 
-    bill_turns = [body for speaker, body in turns if _speaker_label(speaker) == "Bill"]
+    bill_turns = [body for speaker, body in turns if _speaker_label(speaker) != "Tom"]
     tom_turns = [body for speaker, body in turns if _speaker_label(speaker) == "Tom"]
-    question_turns = [body for speaker, body in turns if _speaker_label(speaker) == "Bill" and "?" in body]
+    question_turns = [body for speaker, body in turns if _speaker_label(speaker) != "Tom" and "?" in body]
     decisions = _first_matching(bill_turns + tom_turns, DECISION_CUES, limit=130)
     commitments = _first_matching(tom_turns, COMMITMENT_CUES, limit=130)
+    ask_commit_pair: tuple[str, str] | None = None
     open_loops = [body for body in bill_turns if "?" in body and body not in commitments]
+    pending_question: str | None = None
+    for speaker, body in turns:
+        label = _speaker_label(speaker)
+        if label != "Tom" and "?" in body:
+            pending_question = body
+            continue
+        if label == "Tom" and pending_question and _has_cue(body, COMMITMENT_CUES):
+            ask_commit_pair = (
+                _sentenceish(pending_question, limit=110),
+                _sentenceish(body, limit=110),
+            )
+            break
 
     opener = _sentenceish(turns[0][1], limit=140)
     closer = _sentenceish(turns[-1][1], limit=120)
@@ -149,6 +209,8 @@ def build_compressed_memory_text(entry: dict[str, Any]) -> str:
         lines.append(f"Tom commitments: {' | '.join(commitments)}")
     elif tom_turns:
         lines.append(f"Tom response: {' | '.join(_sentenceish(text, limit=130) for text in tom_turns[:2])}")
+    if ask_commit_pair:
+        lines.append(f"Ask/commit pair: Bill asked {ask_commit_pair[0]} -> Tom committed {ask_commit_pair[1]}")
     if decisions:
         lines.append(f"Decisions / direction: {' | '.join(decisions)}")
     if open_loops:

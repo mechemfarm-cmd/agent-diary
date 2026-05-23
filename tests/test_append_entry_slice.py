@@ -22,12 +22,14 @@ from agent_diary.service.handlers import (
     attach_artifact,
     fetch_entry_detail,
     fetch_raw_entry,
+    import_session_and_refresh_derived,
     import_session_jsonl,
     list_entries,
     list_imports,
     produce_conversation_briefs,
     produce_compressed_memory,
     produce_open_loops,
+    refresh_derived_for_import,
     search_memory,
     status,
 )
@@ -225,8 +227,81 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertIn("Source context:", text)
         self.assertIn("Bill asks:", text)
         self.assertIn("Tom commitments:", text)
+        self.assertIn("Ask/commit pair:", text)
         self.assertIn("Retrieval anchors:", text)
         self.assertIn("browser", text.lower())
+
+    def test_build_compressed_memory_text_pairs_bill_ask_with_following_tom_commitment(self) -> None:
+        text = build_compressed_memory_text(
+            {
+                "created_at": "2026-05-22T12:00:00+00:00",
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "content": (
+                    "Willardmechem: can you verify whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                    "Willardmechem: also can you confirm whether tunnel retries are stable?\n"
+                    "Assistant: noted. I will check tunnel retries after route validation."
+                ),
+            }
+        )
+        self.assertIn(
+            "Ask/commit pair: Bill asked can you verify whether the browser node is back? -> Tom committed yes, I’ll inspect the Mac-side route now.",
+            text,
+        )
+
+    def test_build_compressed_memory_text_retrieval_anchors_preserve_phrases(self) -> None:
+        text = build_compressed_memory_text(
+            {
+                "created_at": "2026-05-22T12:00:00+00:00",
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                    "Willardmechem: great. let me know if the browser node tunnel works."
+                ),
+            }
+        )
+        self.assertIn("Retrieval anchors:", text)
+        anchors_line = [line for line in text.splitlines() if line.startswith("Retrieval anchors:")][0].lower()
+        anchors = [part.strip() for part in anchors_line.split(":", 1)[1].split(",")]
+        self.assertIn("browser node", anchors_line)
+        self.assertIn("mac-side route", anchors_line)
+        self.assertNotIn("check whether", anchors_line)
+        self.assertNotIn("check", anchors)
+        self.assertNotIn("great", anchors)
+        self.assertNotIn("browser", anchors)
+        self.assertNotIn("node", anchors)
+        self.assertNotIn("mac-side", anchors)
+
+    def test_build_compressed_memory_text_regression_representative_artifact_shape(self) -> None:
+        text = build_compressed_memory_text(
+            {
+                "created_at": "2026-05-22T12:00:00+00:00",
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                    "Willardmechem: great. let me know if the browser node tunnel works."
+                ),
+            }
+        )
+        self.assertIn("Bill asks:", text)
+        self.assertIn("Tom commitments:", text)
+        self.assertIn("Ask/commit pair:", text)
+        self.assertIn("Retrieval anchors:", text)
+        anchors_line = [line for line in text.splitlines() if line.startswith("Retrieval anchors:")][0].lower()
+        anchors = [part.strip() for part in anchors_line.split(":", 1)[1].split(",")]
+
+        self.assertIn("browser node", anchors)
+        self.assertIn("mac-side route", anchors)
+        self.assertNotIn("check whether", anchors_line)
+        self.assertNotIn("check", anchors)
+        self.assertNotIn("great", anchors)
+        self.assertNotIn("browser", anchors)
+        self.assertNotIn("node", anchors)
 
     def test_search_memory_returns_match_linked_to_entry_id(self) -> None:
         entry = append_entry(
@@ -288,6 +363,45 @@ class AppendEntrySliceTests(unittest.TestCase):
         fetched = fetch_raw_entry(self.paths, {"entry_id": hit_entry_id})
         self.assertEqual(fetched["entry"]["entry_id"], entry["entry_id"])
         self.assertEqual(fetched["entry"]["content"], "raw truth should remain authoritative")
+
+    def test_search_memory_prefers_latest_compressed_memory_per_entry(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "raw conversation body",
+                "created_at": "2026-05-21T11:05:00+00:00",
+            },
+        )
+        older = attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "older compressed text mentions tunnel",
+                "created_at": "2026-05-21T11:06:00+00:00",
+            },
+        )
+        newer = attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "newest compressed text mentions tunnel and browser node",
+                "created_at": "2026-05-21T11:07:00+00:00",
+            },
+        )
+
+        results = search_memory(self.paths, {"query": "tunnel", "limit": 10})
+        entry_hits = [m for m in results["matches"] if m["entry_id"] == entry["entry_id"]]
+        self.assertEqual(len(entry_hits), 1)
+        self.assertEqual(entry_hits[0]["artifact_id"], newer["artifact_id"])
+        self.assertIn("newest compressed text", entry_hits[0]["match_text"])
+        self.assertNotEqual(entry_hits[0]["artifact_id"], older["artifact_id"])
 
     def test_bootstrap_legacy_memory_index_adds_created_at_safely(self) -> None:
         legacy_db = self.root / "legacy.db"
@@ -445,6 +559,42 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(item["source"], "cli")
         self.assertEqual(item["author_role"], "human")
 
+    def test_list_entries_prefers_newest_conversation_brief_by_created_at(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: summarize status.\nAssistant: on it.",
+                "created_at": "2026-05-23T09:30:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "older brief text",
+                "created_at": "2026-05-23T09:31:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "newer brief text",
+                "created_at": "2026-05-23T09:32:00+00:00",
+            },
+        )
+
+        out = list_entries(self.paths, {"limit": 10, "offset": 0})
+        item = [row for row in out["items"] if row["entry_id"] == entry["entry_id"]][0]
+        self.assertEqual(item["brief"], "newer brief text")
+
     def test_fetch_entry_detail_returns_raw_primary_body(self) -> None:
         entry = append_entry(
             self.paths,
@@ -528,6 +678,77 @@ class AppendEntrySliceTests(unittest.TestCase):
         brief = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "conversation-brief"][0]
         self.assertIn("May 7 rundown", brief["content"])
 
+    def test_fetch_entry_detail_marks_latest_artifact_as_current_per_type(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: status?\nAssistant: checking now.",
+                "created_at": "2026-05-23T11:30:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "older brief",
+                "created_at": "2026-05-23T11:31:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "newer brief",
+                "created_at": "2026-05-23T11:32:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "older memory",
+                "created_at": "2026-05-23T11:33:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "newer memory",
+                "created_at": "2026-05-23T11:34:00+00:00",
+            },
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        artifacts = detail["artifacts"]
+        self.assertEqual(
+            [a["created_at"] for a in artifacts],
+            sorted([a["created_at"] for a in artifacts], reverse=True),
+        )
+
+        briefs = [a for a in artifacts if a["artifact_type"] == "conversation-brief"]
+        self.assertEqual(len(briefs), 2)
+        self.assertEqual(sum(1 for a in briefs if a.get("is_current")), 1)
+        current_brief = [a for a in briefs if a.get("is_current")][0]
+        self.assertEqual(current_brief["content"], "newer brief")
+
+        memories = [a for a in artifacts if a["artifact_type"] == "compressed-memory"]
+        self.assertEqual(len(memories), 2)
+        self.assertEqual(sum(1 for a in memories if a.get("is_current")), 1)
+        current_memory = [a for a in memories if a.get("is_current")][0]
+        self.assertEqual(current_memory["content"], "newer memory")
+
     def test_fetch_entry_detail_includes_open_loop_payload_for_analysis_artifact(self) -> None:
         e1 = append_entry(
             self.paths,
@@ -556,6 +777,123 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertGreaterEqual(len(open_loop_artifacts), 1)
         self.assertIn("open_loops", open_loop_artifacts[0])
         self.assertIsInstance(open_loop_artifacts[0]["open_loops"], list)
+        self.assertEqual(open_loop_artifacts[0]["lineage"]["link_mode"], "direct")
+
+    def test_fetch_entry_detail_surfaces_lineage_linked_open_loop_for_non_anchor_entry(self) -> None:
+        e1 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Pending question: do we have final budget?",
+                "created_at": "2026-05-25T09:00:00+00:00",
+            },
+        )
+        e2 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "TODO follow-up tomorrow about budget approval.",
+                "created_at": "2026-05-25T10:00:00+00:00",
+            },
+        )
+
+        produced = produce_open_loops(self.paths, {"entry_ids": [e1["entry_id"], e2["entry_id"]], "limit": 10})
+        anchor_entry_id = produced["source_entry_ids"][0]
+        self.assertEqual(anchor_entry_id, e2["entry_id"])
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": e1["entry_id"]})
+        open_loop_artifacts = [a for a in detail["artifacts"] if a["artifact_type"] == "analysis:open-loop"]
+        self.assertGreaterEqual(len(open_loop_artifacts), 1)
+        linked = [a for a in open_loop_artifacts if a["lineage"]["link_mode"] == "lineage"][0]
+        self.assertEqual(linked["lineage"]["anchor_entry_id"], e2["entry_id"])
+        self.assertIn(e1["entry_id"], linked["lineage"]["source_entry_ids"])
+        self.assertIn(e2["entry_id"], linked["lineage"]["source_entry_ids"])
+        self.assertIn("open_loops", linked)
+        self.assertIsInstance(linked["open_loops"], list)
+
+    def test_fetch_entry_detail_non_anchor_lineage_open_loops_marks_latest_current(self) -> None:
+        supporting = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Supporting entry for lineage-linked open-loop analysis.",
+                "created_at": "2026-05-25T09:00:00+00:00",
+            },
+        )
+        anchor = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Anchor entry for open-loop analysis runs.",
+                "created_at": "2026-05-25T10:00:00+00:00",
+            },
+        )
+
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": anchor["entry_id"],
+                "artifact_type": "analysis:open-loop",
+                "producer": "open-loop.v1",
+                "content": json.dumps(
+                    {
+                        "loops": [
+                            {"title": "Older unresolved concern", "supporting_entry_ids": [supporting["entry_id"]]},
+                            {"title": "Older unresolved concern B", "supporting_entry_ids": [supporting["entry_id"]]},
+                        ]
+                    }
+                ),
+                "created_at": "2026-05-25T10:05:00+00:00",
+                "metadata": {"source_entry_ids": [supporting["entry_id"], anchor["entry_id"]]},
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": anchor["entry_id"],
+                "artifact_type": "analysis:open-loop",
+                "producer": "open-loop.v1",
+                "content": json.dumps(
+                    {
+                        "loops": [
+                            {"title": "Current unresolved concern", "supporting_entry_ids": [supporting["entry_id"]]},
+                        ]
+                    }
+                ),
+                "created_at": "2026-05-25T10:06:00+00:00",
+                "metadata": {"source_entry_ids": [supporting["entry_id"], anchor["entry_id"]]},
+            },
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": supporting["entry_id"]})
+        linked_open_loops = [
+            a
+            for a in detail["artifacts"]
+            if a["artifact_type"] == "analysis:open-loop" and a["lineage"]["link_mode"] == "lineage"
+        ]
+        self.assertEqual(len(linked_open_loops), 2)
+        self.assertEqual(
+            [a["created_at"] for a in linked_open_loops],
+            sorted([a["created_at"] for a in linked_open_loops], reverse=True),
+        )
+        self.assertEqual(sum(1 for a in linked_open_loops if a.get("is_current")), 1)
+        current = [a for a in linked_open_loops if a.get("is_current")][0]
+        self.assertEqual(current["created_at"], "2026-05-25T10:06:00+00:00")
+        self.assertEqual(current["open_loops"][0]["title"], "Current unresolved concern")
+
+        listed = list_entries(self.paths, {"limit": 10, "offset": 0})
+        row = {item["entry_id"]: item for item in listed["items"]}[supporting["entry_id"]]
+        self.assertEqual(row["open_loop"]["count"], len(current["open_loops"]))
+        self.assertEqual(row["open_loop"]["representative_title"], current["open_loops"][0]["title"])
+        self.assertEqual(row["open_loop"]["last_seen_at"], current["created_at"])
 
     def test_produce_conversation_briefs_attaches_brief_and_list_entries_surfaces_it(self) -> None:
         entry = append_entry(
@@ -602,6 +940,65 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertFalse(results["match_summary"]["using_fallback"])
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
         self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+
+    def test_produce_compressed_memory_representative_transcript_improves_search_handles(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                    "Willardmechem: great. let me know if the browser node tunnel works."
+                ),
+                "created_at": "2026-05-23T12:05:00+00:00",
+            },
+        )
+        produced = produce_compressed_memory(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(produced["produced_count"], 1)
+        self.assertTrue(produced["produced"][0]["indexed_in_memory"])
+
+        results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
+        self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
+        self.assertEqual(results["match_summary"]["raw_entry_fallback_hits"], 0)
+        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
+        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn("mac-side route", results["matches"][0]["match_text"].lower())
+
+    def test_produce_compressed_memory_search_portable_with_non_bill_tom_names(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": (
+                    "Alex: can you check whether the browser node is back?\n"
+                    "Codex: yes, I’ll inspect the Mac-side route now.\n"
+                    "Alex: great. let me know if the node tunnel still works."
+                ),
+                "created_at": "2026-05-23T12:10:00+00:00",
+            },
+        )
+        produced = produce_compressed_memory(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(produced["produced_count"], 1)
+        self.assertTrue(produced["produced"][0]["indexed_in_memory"])
+
+        results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
+        self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
+        self.assertEqual(results["match_summary"]["raw_entry_fallback_hits"], 0)
+        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
+        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn("mac-side route", results["matches"][0]["match_text"].lower())
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        compressed = [a for a in detail["artifacts"] if a["artifact_type"] == "compressed-memory"][0]["content"]
+        self.assertIn("Bill asks:", compressed)
+        self.assertIn("Tom commitments:", compressed)
 
     def test_produce_open_loops_emits_analysis_artifact(self) -> None:
         append_entry(
@@ -666,6 +1063,223 @@ class AppendEntrySliceTests(unittest.TestCase):
         loops = json.loads(artifact_body["content"])["loops"]
         self.assertTrue(any(e1["entry_id"] in loop["supporting_entry_ids"] or e2["entry_id"] in loop["supporting_entry_ids"] for loop in loops))
 
+    def test_list_entries_surfaces_open_loop_participation_for_anchor_and_lineage(self) -> None:
+        e1 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Pending question: do we have final budget?",
+                "created_at": "2026-05-24T11:00:00+00:00",
+            },
+        )
+        e2 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "TODO follow-up tomorrow about budget approval.",
+                "created_at": "2026-05-24T12:00:00+00:00",
+            },
+        )
+        clean = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "This entry is unrelated to open loops.",
+                "created_at": "2026-05-24T13:00:00+00:00",
+            },
+        )
+        produce_open_loops(self.paths, {"entry_ids": [e1["entry_id"], e2["entry_id"]], "limit": 10})
+
+        listed = list_entries(self.paths, {"limit": 10, "offset": 0})
+        by_id = {item["entry_id"]: item for item in listed["items"]}
+
+        self.assertTrue(by_id[e1["entry_id"]]["open_loop"]["has_open_loops"])
+        self.assertGreaterEqual(by_id[e1["entry_id"]]["open_loop"]["count"], 1)
+        self.assertTrue(by_id[e1["entry_id"]]["open_loop"]["representative_title"])
+        self.assertTrue(by_id[e1["entry_id"]]["open_loop"]["last_seen_at"])
+        self.assertTrue(by_id[e2["entry_id"]]["open_loop"]["has_open_loops"])
+        self.assertGreaterEqual(by_id[e2["entry_id"]]["open_loop"]["count"], 1)
+        self.assertTrue(by_id[e2["entry_id"]]["open_loop"]["representative_title"])
+        self.assertTrue(by_id[e2["entry_id"]]["open_loop"]["last_seen_at"])
+        self.assertNotIn("open_loop", by_id[clean["entry_id"]])
+
+        listed_filtered = list_entries(self.paths, {"limit": 10, "offset": 0, "only_with_open_loops": True})
+        filtered_ids = {item["entry_id"] for item in listed_filtered["items"]}
+        self.assertIn(e1["entry_id"], filtered_ids)
+        self.assertIn(e2["entry_id"], filtered_ids)
+        self.assertNotIn(clean["entry_id"], filtered_ids)
+
+    def test_list_entries_open_loop_metadata_uses_latest_analysis_not_artifact_history(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Open-loop participant entry.",
+                "created_at": "2026-05-24T11:00:00+00:00",
+            },
+        )
+
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "analysis:open-loop",
+                "producer": "open-loop.v1",
+                "content": json.dumps(
+                    {
+                        "loops": [
+                            {"title": "Older unresolved concern A", "supporting_entry_ids": [entry["entry_id"]]},
+                            {"title": "Older unresolved concern B", "supporting_entry_ids": [entry["entry_id"]]},
+                        ]
+                    }
+                ),
+                "created_at": "2026-05-24T11:05:00+00:00",
+                "metadata": {"source_entry_ids": [entry["entry_id"]]},
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "analysis:open-loop",
+                "producer": "open-loop.v1",
+                "content": json.dumps(
+                    {
+                        "loops": [
+                            {"title": "Current unresolved concern", "supporting_entry_ids": [entry["entry_id"]]},
+                        ]
+                    }
+                ),
+                "created_at": "2026-05-24T11:06:00+00:00",
+                "metadata": {"source_entry_ids": [entry["entry_id"]]},
+            },
+        )
+
+        listed = list_entries(self.paths, {"limit": 10, "offset": 0})
+        by_id = {item["entry_id"]: item for item in listed["items"]}
+        open_loop = by_id[entry["entry_id"]]["open_loop"]
+        self.assertTrue(open_loop["has_open_loops"])
+        self.assertEqual(open_loop["count"], 1)
+        self.assertEqual(open_loop["representative_title"], "Current unresolved concern")
+        self.assertEqual(open_loop["last_seen_at"], "2026-05-24T11:06:00+00:00")
+
+    def test_list_entries_only_with_open_loops_applies_limit_offset_after_filtering(self) -> None:
+        e1 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Pending question: budget status?",
+                "created_at": "2026-05-24T11:00:00+00:00",
+            },
+        )
+        e2 = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Unrelated entry between participating rows.",
+                "created_at": "2026-05-24T11:30:00+00:00",
+            },
+        )
+        e3 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "TODO follow-up with customer on budget approval.",
+                "created_at": "2026-05-24T12:00:00+00:00",
+            },
+        )
+        e4 = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Another unrelated entry.",
+                "created_at": "2026-05-24T12:30:00+00:00",
+            },
+        )
+        e5 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Pending decision: approve budget timeline.",
+                "created_at": "2026-05-24T13:00:00+00:00",
+            },
+        )
+        produce_open_loops(self.paths, {"entry_ids": [e1["entry_id"], e3["entry_id"], e5["entry_id"]], "limit": 10})
+
+        unfiltered = list_entries(self.paths, {"limit": 10, "offset": 0})
+        unfiltered_ids = {item["entry_id"] for item in unfiltered["items"]}
+        self.assertIn(e2["entry_id"], unfiltered_ids)
+        self.assertIn(e4["entry_id"], unfiltered_ids)
+
+        filtered_all = list_entries(self.paths, {"limit": 10, "offset": 0, "only_with_open_loops": True})
+        filtered_ids = [item["entry_id"] for item in filtered_all["items"]]
+        self.assertEqual(filtered_ids, [e5["entry_id"], e3["entry_id"], e1["entry_id"]])
+
+        filtered_page_1 = list_entries(self.paths, {"limit": 1, "offset": 0, "only_with_open_loops": True})
+        filtered_page_2 = list_entries(self.paths, {"limit": 1, "offset": 1, "only_with_open_loops": True})
+        filtered_page_3 = list_entries(self.paths, {"limit": 1, "offset": 2, "only_with_open_loops": True})
+        self.assertEqual([item["entry_id"] for item in filtered_page_1["items"]], [e5["entry_id"]])
+        self.assertEqual([item["entry_id"] for item in filtered_page_2["items"]], [e3["entry_id"]])
+        self.assertEqual([item["entry_id"] for item in filtered_page_3["items"]], [e1["entry_id"]])
+
+    def test_list_entries_only_with_open_loops_orders_by_last_seen_at_desc(self) -> None:
+        older_entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Pending budget approval follow-up.",
+                "created_at": "2026-05-24T09:00:00+00:00",
+            },
+        )
+        newer_entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Pending staffing decision.",
+                "created_at": "2026-05-24T11:00:00+00:00",
+            },
+        )
+
+        # First run creates an older open-loop artifact for newer_entry.
+        produce_open_loops(self.paths, {"entry_ids": [newer_entry["entry_id"]], "limit": 5})
+        # Second run creates a newer open-loop artifact for older_entry.
+        produce_open_loops(self.paths, {"entry_ids": [older_entry["entry_id"]], "limit": 5})
+
+        unfiltered = list_entries(self.paths, {"limit": 10, "offset": 0})
+        unfiltered_ids = [item["entry_id"] for item in unfiltered["items"]]
+        self.assertLess(unfiltered_ids.index(newer_entry["entry_id"]), unfiltered_ids.index(older_entry["entry_id"]))
+
+        filtered = list_entries(self.paths, {"limit": 10, "offset": 0, "only_with_open_loops": True})
+        filtered_ids = [item["entry_id"] for item in filtered["items"]]
+        self.assertEqual(filtered_ids[0], older_entry["entry_id"])
+        self.assertEqual(filtered_ids[1], newer_entry["entry_id"])
+        self.assertGreaterEqual(
+            filtered["items"][0]["open_loop"]["last_seen_at"],
+            filtered["items"][1]["open_loop"]["last_seen_at"],
+        )
+
     def test_produce_open_loops_does_not_mutate_raw_entries(self) -> None:
         entry = append_entry(
             self.paths,
@@ -713,6 +1327,74 @@ class AppendEntrySliceTests(unittest.TestCase):
         artifact_file = Path(produced["artifact_file"])
         loops = json.loads(json.loads(artifact_file.read_text(encoding="utf-8"))["content"])["loops"]
         self.assertEqual(len(loops), 0)
+
+    def test_produce_open_loops_detects_conversational_check_request(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                    "Willardmechem: great. let me know if the tunnel still works."
+                ),
+                "created_at": "2026-05-24T16:00:00+00:00",
+            },
+        )
+        produced = produce_open_loops(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        artifact_file = Path(produced["artifact_file"])
+        loops = json.loads(json.loads(artifact_file.read_text(encoding="utf-8"))["content"])["loops"]
+        self.assertGreaterEqual(len(loops), 1)
+        loop_text = json.dumps(loops).lower()
+        self.assertIn("browser node", loop_text)
+
+    def test_produce_open_loops_suppresses_addressed_request_keeps_unresolved_followup(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": (
+                    "Willardmechem: can you check whether the browser node is back?\n"
+                    "Assistant: checked now, browser node is back and confirmed.\n"
+                    "Willardmechem: great, can you let me know if the tunnel still works?"
+                ),
+                "created_at": "2026-05-24T16:10:00+00:00",
+            },
+        )
+        produced = produce_open_loops(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        artifact_file = Path(produced["artifact_file"])
+        loops = json.loads(json.loads(artifact_file.read_text(encoding="utf-8"))["content"])["loops"]
+        self.assertGreaterEqual(len(loops), 1)
+        loop_text = json.dumps(loops).lower()
+        self.assertIn("tunnel still works", loop_text)
+        self.assertNotIn("can you check whether the browser node is back", loop_text)
+
+    def test_produce_open_loops_portable_with_non_bill_tom_names(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": (
+                    "Alex: can you check whether the browser node is back?\n"
+                    "Codex: checked now, browser node is back and confirmed.\n"
+                    "Alex: great, can you let me know if the tunnel still works?"
+                ),
+                "created_at": "2026-05-24T16:20:00+00:00",
+            },
+        )
+        produced = produce_open_loops(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        artifact_file = Path(produced["artifact_file"])
+        loops = json.loads(json.loads(artifact_file.read_text(encoding="utf-8"))["content"])["loops"]
+        self.assertGreaterEqual(len(loops), 1)
+        loop_text = json.dumps(loops).lower()
+        self.assertIn("tunnel still works", loop_text)
+        self.assertNotIn("can you check whether the browser node is back", loop_text)
 
     def test_import_session_jsonl_writes_manifest_and_truthful_ingestion_metadata(self) -> None:
         source_file = self.root / "session.jsonl"
@@ -794,6 +1476,119 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(second["imported_count"], 0)
         self.assertEqual(second["skipped_count"], 1)
         self.assertEqual(second["skipped"][0]["reason"], "duplicate_source_item")
+
+    def test_import_session_and_refresh_derived_runs_core_producers_for_imported_entries(self) -> None:
+        source_file = self.root / "import-and-analyze.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T15:00:00+00:00",
+                    "content": (
+                        "Willardmechem: can you check whether the browser node is back?\n"
+                        "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                        "Willardmechem: great. let me know if the tunnel still works."
+                    ),
+                    "metadata": {"source_message_id": "import-analyze-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        first = import_session_and_refresh_derived(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import_analyze_first",
+                "source_session_id": "session-derive-1",
+                "source_conversation_id": "telegram:derive-1",
+            },
+        )
+        self.assertEqual(first["imported_count"], 1)
+        self.assertEqual(first["skipped_count"], 0)
+        self.assertEqual(first["derived"]["conversation_briefs"]["status"], "ok")
+        self.assertEqual(first["derived"]["compressed_memory"]["status"], "ok")
+        self.assertEqual(first["derived"]["open_loops"]["status"], "ok")
+        self.assertGreaterEqual(first["derived"]["conversation_briefs"]["produced_count"], 1)
+        self.assertGreaterEqual(first["derived"]["compressed_memory"]["produced_count"], 1)
+        self.assertIsNotNone(first["derived"]["open_loops"]["artifact_id"])
+
+        imported_entry_id = first["imported_entry_ids"][0]
+        detail = fetch_entry_detail(self.paths, {"entry_id": imported_entry_id})
+        artifact_types = {artifact["artifact_type"] for artifact in detail["artifacts"]}
+        self.assertIn("conversation-brief", artifact_types)
+        self.assertIn("compressed-memory", artifact_types)
+
+        second = import_session_and_refresh_derived(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import_analyze_second",
+                "source_session_id": "session-derive-1",
+                "source_conversation_id": "telegram:derive-1",
+            },
+        )
+        self.assertEqual(second["imported_count"], 0)
+        self.assertEqual(second["skipped_count"], 1)
+        self.assertEqual(second["derived"]["conversation_briefs"]["status"], "skipped_no_imports")
+        self.assertEqual(second["derived"]["compressed_memory"]["status"], "skipped_no_imports")
+        self.assertEqual(second["derived"]["open_loops"]["status"], "skipped_no_imports")
+
+    def test_refresh_derived_for_import_reruns_without_reimporting_raw_entries(self) -> None:
+        source_file = self.root / "refresh-derived.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T16:00:00+00:00",
+                    "content": (
+                        "Willardmechem: can you check whether the browser node is back?\n"
+                        "Assistant: yes, I’ll inspect the Mac-side route now.\n"
+                        "Willardmechem: great. let me know if the tunnel still works."
+                    ),
+                    "metadata": {"source_message_id": "refresh-derived-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        imported = import_session_and_refresh_derived(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import_refresh_target",
+                "source_session_id": "session-refresh-1",
+                "source_conversation_id": "telegram:refresh-1",
+            },
+        )
+        self.assertEqual(imported["imported_count"], 1)
+        entry_id = imported["imported_entry_ids"][0]
+        first_open_loop_artifact_id = imported["derived"]["open_loops"]["artifact_id"]
+
+        refreshed = refresh_derived_for_import(self.paths, {"import_id": "import_refresh_target"})
+        self.assertEqual(refreshed["import_id"], "import_refresh_target")
+        self.assertEqual(refreshed["imported_entry_count"], 1)
+        self.assertEqual(refreshed["imported_entry_ids"], [entry_id])
+        self.assertTrue(refreshed["force"])
+        self.assertEqual(refreshed["derived"]["conversation_briefs"]["status"], "ok")
+        self.assertEqual(refreshed["derived"]["compressed_memory"]["status"], "ok")
+        self.assertEqual(refreshed["derived"]["open_loops"]["status"], "ok")
+        self.assertGreaterEqual(refreshed["derived"]["conversation_briefs"]["produced_count"], 1)
+        self.assertGreaterEqual(refreshed["derived"]["compressed_memory"]["produced_count"], 1)
+        self.assertIsNotNone(refreshed["derived"]["open_loops"]["artifact_id"])
+        self.assertNotEqual(refreshed["derived"]["open_loops"]["artifact_id"], first_open_loop_artifact_id)
+
+        repeated = refresh_derived_for_import(self.paths, {"import_id": "import_refresh_target"})
+        self.assertEqual(repeated["imported_entry_count"], 1)
+        self.assertEqual(repeated["derived"]["conversation_briefs"]["status"], "ok")
+        self.assertEqual(repeated["derived"]["compressed_memory"]["status"], "ok")
+        self.assertEqual(repeated["derived"]["open_loops"]["status"], "ok")
 
     def test_import_session_jsonl_dry_run_reports_without_writing_entries(self) -> None:
         source_file = self.root / "dry-run.jsonl"

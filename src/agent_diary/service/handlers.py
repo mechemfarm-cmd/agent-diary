@@ -33,6 +33,7 @@ from agent_diary.storage.entry_reader import fetch_raw_entry as fetch_entry_from
 from agent_diary.storage.files import append_artifact, append_raw_entry
 from agent_diary.storage.imports import (
     build_source_item_key,
+    load_import_batch_manifest,
     list_import_batch_manifests,
     load_import_ledger,
     save_import_ledger,
@@ -186,6 +187,123 @@ def import_session_jsonl(paths: Paths, payload: dict[str, Any]) -> dict[str, Any
     return manifest
 
 
+def import_session_and_refresh_derived(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    import_result = import_session_jsonl(paths, payload)
+    imported_entry_ids = [
+        str(item.get("entry_id", "")).strip()
+        for item in import_result.get("imported", [])
+        if str(item.get("entry_id", "")).strip()
+    ]
+    dry_run = bool(payload.get("dry_run", False))
+    derived: dict[str, Any] = {}
+    if dry_run:
+        derived = {
+            "conversation_briefs": {"status": "skipped_dry_run", "produced_count": 0, "skipped_count": 0},
+            "compressed_memory": {"status": "skipped_dry_run", "produced_count": 0, "skipped_count": 0},
+            "open_loops": {"status": "skipped_dry_run", "loop_count": 0},
+        }
+    elif not imported_entry_ids:
+        derived = {
+            "conversation_briefs": {"status": "skipped_no_imports", "produced_count": 0, "skipped_count": 0},
+            "compressed_memory": {"status": "skipped_no_imports", "produced_count": 0, "skipped_count": 0},
+            "open_loops": {"status": "skipped_no_imports", "loop_count": 0},
+        }
+    else:
+        brief_result = produce_conversation_briefs(paths, {"entry_ids": imported_entry_ids, "limit": len(imported_entry_ids)})
+        memory_result = produce_compressed_memory(paths, {"entry_ids": imported_entry_ids, "limit": len(imported_entry_ids)})
+        open_loops_result = produce_open_loops(paths, {"entry_ids": imported_entry_ids, "limit": len(imported_entry_ids)})
+        derived = {
+            "conversation_briefs": {
+                "status": "ok",
+                "produced_count": int(brief_result.get("produced_count", 0)),
+                "skipped_count": int(brief_result.get("skipped_count", 0)),
+            },
+            "compressed_memory": {
+                "status": "ok",
+                "produced_count": int(memory_result.get("produced_count", 0)),
+                "skipped_count": int(memory_result.get("skipped_count", 0)),
+            },
+            "open_loops": {
+                "status": "ok",
+                "loop_count": int(open_loops_result.get("loop_count", 0)),
+                "artifact_id": open_loops_result.get("artifact_id"),
+            },
+        }
+
+    return {
+        "import_id": import_result.get("import_id"),
+        "imported_count": int(import_result.get("imported_count", 0)),
+        "skipped_count": int(import_result.get("skipped_count", 0)),
+        "imported_entry_ids": imported_entry_ids,
+        "import_result": import_result,
+        "derived": derived,
+    }
+
+
+def refresh_derived_for_import(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    _require_fields(payload, ["import_id"])
+    import_id = str(payload["import_id"]).strip()
+    if not import_id:
+        raise ValueError("import_id is required")
+    dry_run = bool(payload.get("dry_run", False))
+    force = bool(payload.get("force", True))
+
+    manifest = load_import_batch_manifest(paths, import_id=import_id)
+    imported_entry_ids = [
+        str(item.get("entry_id", "")).strip()
+        for item in manifest.get("imported", [])
+        if isinstance(item, dict) and str(item.get("entry_id", "")).strip()
+    ]
+
+    if dry_run:
+        derived = {
+            "conversation_briefs": {"status": "skipped_dry_run", "produced_count": 0, "skipped_count": 0},
+            "compressed_memory": {"status": "skipped_dry_run", "produced_count": 0, "skipped_count": 0},
+            "open_loops": {"status": "skipped_dry_run", "loop_count": 0},
+        }
+    elif not imported_entry_ids:
+        derived = {
+            "conversation_briefs": {"status": "skipped_no_imported_entries", "produced_count": 0, "skipped_count": 0},
+            "compressed_memory": {"status": "skipped_no_imported_entries", "produced_count": 0, "skipped_count": 0},
+            "open_loops": {"status": "skipped_no_imported_entries", "loop_count": 0},
+        }
+    else:
+        brief_result = produce_conversation_briefs(
+            paths, {"entry_ids": imported_entry_ids, "limit": len(imported_entry_ids), "force": force}
+        )
+        memory_result = produce_compressed_memory(
+            paths, {"entry_ids": imported_entry_ids, "limit": len(imported_entry_ids), "force": force}
+        )
+        open_loops_result = produce_open_loops(paths, {"entry_ids": imported_entry_ids, "limit": len(imported_entry_ids)})
+        derived = {
+            "conversation_briefs": {
+                "status": "ok",
+                "produced_count": int(brief_result.get("produced_count", 0)),
+                "skipped_count": int(brief_result.get("skipped_count", 0)),
+            },
+            "compressed_memory": {
+                "status": "ok",
+                "produced_count": int(memory_result.get("produced_count", 0)),
+                "skipped_count": int(memory_result.get("skipped_count", 0)),
+            },
+            "open_loops": {
+                "status": "ok",
+                "loop_count": int(open_loops_result.get("loop_count", 0)),
+                "artifact_id": open_loops_result.get("artifact_id"),
+            },
+        }
+
+    return {
+        "import_id": import_id,
+        "imported_entry_count": len(imported_entry_ids),
+        "imported_entry_ids": imported_entry_ids,
+        "manifest_path": str(paths.imports_dir / "batches" / f"{import_id}.json"),
+        "force": force,
+        "dry_run": dry_run,
+        "derived": derived,
+    }
+
+
 def list_imports(paths: Paths, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
     limit = int(payload.get("limit", 20))
@@ -245,6 +363,55 @@ def _build_preview(text: str, size: int = 140) -> str:
     if len(compact) <= size:
         return compact
     return compact[: size - 3] + "..."
+
+
+def _build_open_loop_participation(paths: Paths) -> dict[str, dict[str, Any]]:
+    participation: dict[str, dict[str, Any]] = {}
+    for artifact_file in paths.artifacts_dir.glob("*/artifact_*.json"):
+        try:
+            artifact = json.loads(artifact_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(artifact.get("artifact_type", "")).strip() != "analysis:open-loop":
+            continue
+        metadata = artifact.get("metadata")
+        source_entry_ids: list[str] = []
+        if isinstance(metadata, dict):
+            source_entry_ids = [str(e).strip() for e in metadata.get("source_entry_ids", []) if str(e).strip()]
+        if not source_entry_ids:
+            anchor_id = str(artifact.get("entry_id", "")).strip()
+            if anchor_id:
+                source_entry_ids = [anchor_id]
+        loops: list[dict[str, Any]] = []
+        try:
+            raw_loops = json.loads(str(artifact.get("content", "{}"))).get("loops", [])
+            if isinstance(raw_loops, list):
+                loops = [loop for loop in raw_loops if isinstance(loop, dict)]
+        except json.JSONDecodeError:
+            loops = []
+        representative_title = None
+        if loops:
+            candidate = str(loops[0].get("title", "")).strip()
+            if candidate:
+                representative_title = candidate
+        created_at = str(artifact.get("created_at", "")).strip()
+        artifact_id = str(artifact.get("artifact_id", "")).strip()
+        key = (created_at, artifact_id)
+        for entry_id in source_entry_ids:
+            current = participation.get(entry_id)
+            current_key = (
+                str(current.get("latest_created_at", "")),
+                str(current.get("latest_artifact_id", "")),
+            ) if isinstance(current, dict) else ("", "")
+            if current is None or key >= current_key:
+                participation[entry_id] = {
+                    "count": len(loops),
+                    "latest_created_at": created_at,
+                    "latest_artifact_id": artifact_id,
+                    "representative_title": representative_title,
+                    "last_seen_at": created_at or None,
+                }
+    return participation
 
 
 def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, Any]]:
@@ -373,36 +540,74 @@ def fetch_raw_entry(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
 def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     limit = int(payload.get("limit", 20))
     offset = int(payload.get("offset", 0))
+    only_with_open_loops = bool(payload.get("only_with_open_loops", False))
     if limit < 1:
         raise ValueError("limit must be >= 1")
     if offset < 0:
         raise ValueError("offset must be >= 0")
 
-    rows = list_entry_rows(paths.sqlite_path, limit=limit, offset=offset)
+    row_offset = offset
+    rows: list[dict[str, Any]]
+    open_loop_participation = _build_open_loop_participation(paths)
+    if only_with_open_loops:
+        # In filtered mode, limit/offset apply to the filtered result set, ordered by
+        # open-loop freshness (latest linked last_seen_at), then stable tiebreakers.
+        all_rows = list_entry_rows(paths.sqlite_path, limit=1000000, offset=0)
+        participating_rows = []
+        for row in all_rows:
+            loop_info = open_loop_participation.get(str(row["entry_id"]))
+            if loop_info and int(loop_info.get("count", 0)) > 0:
+                participating_rows.append(row)
+        participating_rows.sort(
+            key=lambda r: (
+                str(open_loop_participation.get(str(r["entry_id"]), {}).get("last_seen_at", "")),
+                str(r.get("created_at", "")),
+                str(r.get("entry_id", "")),
+            ),
+            reverse=True,
+        )
+        rows = participating_rows[offset : offset + limit]
+        row_offset = offset
+    else:
+        rows = list_entry_rows(paths.sqlite_path, limit=limit, offset=offset)
     items: list[dict[str, Any]] = []
     for row in rows:
         raw_file = Path(row["raw_file_path"])
         body = json.loads(raw_file.read_text(encoding="utf-8"))
         brief = None
+        latest_brief_key: tuple[str, str] | None = None
         artifact_dir = paths.artifacts_dir / row["entry_id"]
         if artifact_dir.exists():
             for artifact_file in sorted(artifact_dir.glob("*.json")):
                 artifact_body = json.loads(artifact_file.read_text(encoding="utf-8"))
                 if artifact_body.get("artifact_type") == "conversation-brief":
-                    brief = str(artifact_body.get("content", "")).strip() or None
-        items.append(
-            {
-                "entry_id": row["entry_id"],
-                "created_at": row["created_at"],
-                "entry_type": body.get("entry_type", "unknown"),
-                "source": row["source"],
-                "author_role": row["author_role"],
-                "brief": brief,
-                "preview": _build_preview(str(body.get("content", ""))),
+                    key = (
+                        str(artifact_body.get("created_at", "")).strip(),
+                        str(artifact_body.get("artifact_id", "")).strip(),
+                    )
+                    if latest_brief_key is None or key > latest_brief_key:
+                        latest_brief_key = key
+                        brief = str(artifact_body.get("content", "")).strip() or None
+        item = {
+            "entry_id": row["entry_id"],
+            "created_at": row["created_at"],
+            "entry_type": body.get("entry_type", "unknown"),
+            "source": row["source"],
+            "author_role": row["author_role"],
+            "brief": brief,
+            "preview": _build_preview(str(body.get("content", ""))),
+        }
+        loop_info = open_loop_participation.get(str(row["entry_id"]))
+        if loop_info and int(loop_info.get("count", 0)) > 0:
+            item["open_loop"] = {
+                "has_open_loops": True,
+                "count": int(loop_info.get("count", 0)),
+                "representative_title": str(loop_info.get("representative_title") or "").strip() or None,
+                "last_seen_at": str(loop_info.get("last_seen_at") or "").strip() or None,
             }
-        )
+        items.append(item)
 
-    return {"limit": limit, "offset": offset, "items": items}
+    return {"limit": limit, "offset": row_offset, "items": items}
 
 
 def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -415,9 +620,13 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     )
     entry = fetched["entry"]
     artifacts = []
+    seen_artifact_ids: set[str] = set()
     for a in fetched.get("artifacts", []):
+        artifact_id = str(a.get("artifact_id", "")).strip()
+        if artifact_id:
+            seen_artifact_ids.add(artifact_id)
         artifact = {
-            "artifact_id": a.get("artifact_id"),
+            "artifact_id": artifact_id or a.get("artifact_id"),
             "artifact_type": a.get("artifact_type"),
             "producer": a.get("producer"),
             "created_at": a.get("created_at"),
@@ -425,11 +634,38 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         if a.get("artifact_type") in {"memory", "compressed-memory", "conversation-brief"}:
             artifact["content"] = a.get("content", "")
         if a.get("artifact_type") == "analysis:open-loop":
+            metadata = a.get("metadata") if isinstance(a.get("metadata"), dict) else {}
+            artifact["lineage"] = {
+                "link_mode": "direct",
+                "anchor_entry_id": str(a.get("entry_id", entry["entry_id"])),
+                "source_entry_ids": [str(e) for e in metadata.get("source_entry_ids", []) if str(e).strip()],
+            }
             try:
                 artifact["open_loops"] = json.loads(str(a.get("content", "{}"))).get("loops", [])
             except json.JSONDecodeError:
                 artifact["open_loops"] = []
         artifacts.append(artifact)
+
+    for linked in _find_linked_open_loop_artifacts(paths, entry_id=str(entry["entry_id"]), exclude_artifact_ids=seen_artifact_ids):
+        artifacts.append(linked)
+
+    artifacts.sort(key=lambda a: (str(a.get("created_at", "")), str(a.get("artifact_id", ""))), reverse=True)
+    latest_by_type: dict[str, tuple[str, str]] = {}
+    for artifact in artifacts:
+        artifact_type = str(artifact.get("artifact_type", "")).strip()
+        if not artifact_type:
+            continue
+        key = (str(artifact.get("created_at", "")), str(artifact.get("artifact_id", "")))
+        current = latest_by_type.get(artifact_type)
+        if current is None or key > current:
+            latest_by_type[artifact_type] = key
+    for artifact in artifacts:
+        artifact_type = str(artifact.get("artifact_type", "")).strip()
+        if not artifact_type:
+            continue
+        key = (str(artifact.get("created_at", "")), str(artifact.get("artifact_id", "")))
+        artifact["is_current"] = key == latest_by_type.get(artifact_type)
+
     return {
         "entry_id": entry["entry_id"],
         "raw_entry": entry,
@@ -439,6 +675,46 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "secondary": "artifacts",
         },
     }
+
+
+def _find_linked_open_loop_artifacts(paths: Paths, *, entry_id: str, exclude_artifact_ids: set[str]) -> list[dict[str, Any]]:
+    linked: list[dict[str, Any]] = []
+    for artifact_file in paths.artifacts_dir.glob("*/artifact_*.json"):
+        try:
+            body = json.loads(artifact_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(body.get("artifact_type", "")).strip() != "analysis:open-loop":
+            continue
+        artifact_id = str(body.get("artifact_id", "")).strip()
+        if not artifact_id or artifact_id in exclude_artifact_ids:
+            continue
+        metadata = body.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        source_entry_ids = [str(e).strip() for e in metadata.get("source_entry_ids", []) if str(e).strip()]
+        if entry_id not in source_entry_ids:
+            continue
+        try:
+            open_loops = json.loads(str(body.get("content", "{}"))).get("loops", [])
+        except json.JSONDecodeError:
+            open_loops = []
+        linked.append(
+            {
+                "artifact_id": artifact_id,
+                "artifact_type": "analysis:open-loop",
+                "producer": body.get("producer"),
+                "created_at": body.get("created_at"),
+                "open_loops": open_loops,
+                "lineage": {
+                    "link_mode": "lineage",
+                    "anchor_entry_id": str(body.get("entry_id", "")),
+                    "source_entry_ids": source_entry_ids,
+                },
+            }
+        )
+    linked.sort(key=lambda a: (str(a.get("created_at", "")), str(a.get("artifact_id", ""))), reverse=True)
+    return linked
 
 
 def produce_open_loops(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:

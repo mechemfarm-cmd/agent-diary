@@ -14,12 +14,14 @@ from agent_diary.service.handlers import (
     attach_artifact,
     fetch_entry_detail,
     fetch_raw_entry,
+    import_session_and_refresh_derived,
     import_session_jsonl,
     list_entries,
     list_imports,
     produce_conversation_briefs,
     produce_compressed_memory,
     produce_open_loops,
+    refresh_derived_for_import,
     search_memory,
 )
 from agent_diary.service.http_server import run_server
@@ -103,6 +105,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_session_import.add_argument("--source-session-id", help="override or supply the source session id")
     p_session_import.add_argument("--source-conversation-id", help="override or supply the source conversation id")
     p_session_import.add_argument("--dry-run", action="store_true", help="plan the import without writing raw entries")
+
+    p_session_import_and_analyze = sub.add_parser(
+        "import-session-and-analyze",
+        help="import session-import JSONL and refresh core derived artifacts in one step",
+        description="Import canonical session-import JSONL, then produce conversation briefs, compressed memory, and open-loop analysis for imported entries.",
+    )
+    p_session_import_and_analyze.add_argument("--path", required=True, help="path to session-import JSONL")
+    p_session_import_and_analyze.add_argument("--import-id", help="optional batch id; defaults to a readable id when omitted")
+    p_session_import_and_analyze.add_argument("--source-session-id", help="override or supply the source session id")
+    p_session_import_and_analyze.add_argument("--source-conversation-id", help="override or supply the source conversation id")
+    p_session_import_and_analyze.add_argument("--dry-run", action="store_true", help="plan the import without writing raw entries")
+
+    p_refresh_import = sub.add_parser(
+        "refresh-derived-for-import",
+        help="recompute derived artifacts for a previously imported batch",
+        description="Refresh conversation briefs, compressed memory, and open-loop analysis for entries already imported under one import_id.",
+    )
+    p_refresh_import.add_argument("--import-id", required=True, help="existing import batch id to refresh")
+    p_refresh_import.add_argument("--dry-run", action="store_true", help="show what would refresh without writing new artifacts")
+    p_refresh_import.add_argument("--no-force", action="store_true", help="do not force brief/memory regeneration when artifacts already exist")
 
     p_openclaw_import = sub.add_parser(
         "import-openclaw-session",
@@ -311,6 +333,32 @@ def main() -> None:
                 "source_session_id": args.source_session_id,
                 "source_conversation_id": args.source_conversation_id,
                 "dry_run": args.dry_run,
+            },
+        )
+        _print(out, args.json)
+        return
+
+    if args.command == "import-session-and-analyze":
+        out = import_session_and_refresh_derived(
+            paths,
+            {
+                "path": args.path,
+                "import_id": args.import_id,
+                "source_session_id": args.source_session_id,
+                "source_conversation_id": args.source_conversation_id,
+                "dry_run": args.dry_run,
+            },
+        )
+        _print(out, args.json)
+        return
+
+    if args.command == "refresh-derived-for-import":
+        out = refresh_derived_for_import(
+            paths,
+            {
+                "import_id": args.import_id,
+                "dry_run": args.dry_run,
+                "force": not args.no_force,
             },
         )
         _print(out, args.json)
