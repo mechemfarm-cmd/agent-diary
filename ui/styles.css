@@ -474,6 +474,62 @@ body::after {
   margin-bottom: 10px;
 }
 
+.import-inspector {
+  border: 1px dashed rgba(185, 141, 100, 0.65);
+  border-radius: 14px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  background: rgba(255, 251, 243, 0.8);
+}
+
+.import-inspector h3 {
+  margin: 0 0 6px;
+  font-size: 0.82rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #7a6256;
+}
+
+.import-list {
+  max-height: 18vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.import-list button {
+  width: 100%;
+  text-align: left;
+}
+
+.browse-scope {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto auto;
+  gap: 6px 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.browse-scope label {
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.browse-scope input[type="text"] {
+  width: 100%;
+  border: 1px solid rgba(185, 141, 100, 0.75);
+  border-radius: 999px;
+  background: rgba(255, 250, 241, 0.95);
+  padding: 6px 10px;
+  font-size: 0.8rem;
+}
+
+.scope-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
 .list {
   list-style: none;
   padding: 0;
@@ -737,6 +793,24 @@ body::after {
   letter-spacing: 0.08em;
 }
 
+.stale-badge {
+  display: inline-block;
+  margin-top: 6px;
+  margin-bottom: 4px;
+  padding: 2px 8px;
+  border: 1px solid rgba(181, 103, 108, 0.7);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  color: #6b1f28;
+  background: rgba(255, 236, 238, 0.96);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.stale-meta {
+  font-size: 0.74rem;
+}
+
 .loop-list {
   list-style: none;
   margin: 8px 0 0;
@@ -780,6 +854,45 @@ body::after {
   display: flex;
   gap: 8px;
   margin-bottom: 10px;
+}
+
+.overlay-form {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.overlay-form label {
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.overlay-form input,
+.overlay-form select,
+.overlay-form textarea {
+  width: 100%;
+  border: 1px solid rgba(185, 141, 100, 0.75);
+  border-radius: 10px;
+  background: rgba(255, 250, 241, 0.95);
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 0.84rem;
+}
+
+.overlay-form textarea {
+  resize: vertical;
+}
+
+.refresh-derived-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.refresh-derived-actions button {
+  font-size: 0.8rem;
 }
 
 .search-form input {
@@ -934,5 +1047,9 @@ button:focus-visible,
 
   .title-stack {
     text-align: center;
+  }
+
+  .browse-scope {
+    grid-template-columns: 1fr;
   }
 }

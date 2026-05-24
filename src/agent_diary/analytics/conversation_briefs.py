@@ -117,8 +117,23 @@ def entry_has_artifact_type(paths: Paths, *, entry_id: str, artifact_type: str) 
     artifact_dir = paths.artifacts_dir / entry_id
     if not artifact_dir.exists():
         return False
+    matching: list[dict[str, Any]] = []
     for path in artifact_dir.glob("*.json"):
         body = _read_json(path)
         if str(body.get("artifact_type", "")).strip() == artifact_type:
-            return True
-    return False
+            matching.append(body)
+    if not matching:
+        return False
+
+    active = []
+    for body in matching:
+        metadata = body.get("metadata")
+        if not isinstance(metadata, dict):
+            active.append(body)
+            continue
+        lifecycle = str(metadata.get("lifecycle_status", "")).strip().lower()
+        if lifecycle != "superseded":
+            active.append(body)
+    if not active:
+        return False
+    return True

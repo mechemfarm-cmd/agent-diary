@@ -19,6 +19,7 @@ from agent_diary.config import default_paths
 from agent_diary.index.sqlite_index import bootstrap_sqlite
 from agent_diary.service.handlers import (
     append_entry,
+    append_overlay,
     attach_artifact,
     fetch_entry_detail,
     fetch_raw_entry,
@@ -26,6 +27,7 @@ from agent_diary.service.handlers import (
     import_session_jsonl,
     list_entries,
     list_imports,
+    normalize_derived_artifact_lifecycle,
     produce_conversation_briefs,
     produce_compressed_memory,
     produce_open_loops,
@@ -33,6 +35,7 @@ from agent_diary.service.handlers import (
     search_memory,
     status,
 )
+from agent_diary.service.http_server import AgentDiaryHandler
 from agent_diary.storage.files import ensure_data_dirs
 
 
@@ -114,6 +117,59 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(fetched["entry"]["content"], "authoritative content")
         self.assertEqual(fetched["entry"]["metadata"], {"tag": "important"})
 
+    def test_append_overlay_writes_file_and_keeps_raw_entry_unchanged(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "source truth content",
+                "created_at": "2026-05-20T12:30:00+00:00",
+            },
+        )
+        before = fetch_raw_entry(self.paths, {"entry_id": entry["entry_id"]})["entry"]
+        out = append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "correction",
+                "author": "operator",
+                "content": "Correction note without rewriting source truth.",
+            },
+        )
+        self.assertTrue(Path(out["overlay_file"]).exists())
+        fetched = fetch_raw_entry(self.paths, {"entry_id": entry["entry_id"], "include_overlays": True})
+        self.assertEqual(len(fetched["overlays"]), 1)
+        self.assertEqual(fetched["overlays"][0]["overlay_type"], "correction")
+        self.assertEqual(fetched["entry"], before)
+
+    def test_fetch_entry_detail_includes_overlays_as_secondary_layer(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "human",
+                "content": "raw truth stays as-is",
+                "created_at": "2026-05-20T12:40:00+00:00",
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "annotation",
+                "author": "reviewer",
+                "content": "Annotation about context.",
+            },
+        )
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        self.assertEqual(len(detail["overlays"]), 1)
+        self.assertEqual(detail["overlays"][0]["overlay_type"], "annotation")
+        self.assertEqual(detail["truth_model"]["primary"], "raw_entry")
+        self.assertEqual(detail["truth_model"]["overlay_layer"], "overlays")
+
     def test_cli_append_entry_command_works(self) -> None:
         cmd = [
             sys.executable,
@@ -149,10 +205,58 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertIn("raw_file", out)
         self.assertTrue(Path(out["raw_file"]).exists())
 
+    def test_cli_append_overlay_command_works(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "base truth",
+                "created_at": "2026-05-20T13:10:00+00:00",
+            },
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "append-overlay",
+            "--entry-id",
+            entry["entry_id"],
+            "--overlay-type",
+            "annotation",
+            "--author",
+            "operator",
+            "--content",
+            "Overlay through CLI.",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["entry_id"], entry["entry_id"])
+        self.assertEqual(out["overlay_type"], "annotation")
+        self.assertTrue(Path(out["overlay_file"]).exists())
+
     def test_status_handler_contract(self) -> None:
         body = status(self.paths)
         self.assertTrue(body["ok"])
         self.assertEqual(body["sqlite_path"], str(self.paths.sqlite_path))
+
+    def test_http_routes_include_list_imports_and_producer_endpoints(self) -> None:
+        self.assertIn("/list_imports", AgentDiaryHandler.routes)
+        self.assertIn("/append_overlay", AgentDiaryHandler.routes)
+        self.assertIn("/produce_open_loops", AgentDiaryHandler.routes)
+        self.assertIn("/produce_conversation_briefs", AgentDiaryHandler.routes)
+        self.assertIn("/produce_compressed_memory", AgentDiaryHandler.routes)
 
     def test_attach_compressed_memory_artifact_creates_memory_index_row(self) -> None:
         entry = append_entry(
@@ -532,6 +636,323 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertIn("deadline", snippet.lower())
         self.assertLess(len(snippet), len(long_text))
 
+    def test_search_memory_raw_fallback_matches_overlay_effective_content(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "raw body without the target token",
+                "created_at": "2026-05-22T10:05:00+00:00",
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "correction",
+                "author": "operator",
+                "content": "Effective correction mentions overlay-search-token.",
+            },
+        )
+
+        results = search_memory(self.paths, {"query": "overlay-search-token", "limit": 5})
+        self.assertEqual(results["match_summary"]["compressed_memory_hits"], 0)
+        self.assertTrue(results["match_summary"]["using_fallback"])
+        self.assertEqual(len(results["matches"]), 1)
+        self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
+
+    def test_search_memory_filters_compressed_hits_by_source_conversation_id(self) -> None:
+        source_file_a = self.root / "search-compressed-scope-a.jsonl"
+        source_file_a.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T12:00:00+00:00",
+                    "content": "Scoped A raw entry.",
+                    "metadata": {"source_message_id": "search-scope-a-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        source_file_b = self.root / "search-compressed-scope-b.jsonl"
+        source_file_b.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T12:01:00+00:00",
+                    "content": "Scoped B raw entry.",
+                    "metadata": {"source_message_id": "search-scope-b-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        imported_a = import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_a),
+                "import_id": "import-search-scope-a",
+                "source_session_id": "session-search-scope-a",
+                "source_conversation_id": "telegram:search-scope-a",
+            },
+        )
+        imported_b = import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_b),
+                "import_id": "import-search-scope-b",
+                "source_session_id": "session-search-scope-b",
+                "source_conversation_id": "telegram:search-scope-b",
+            },
+        )
+        entry_id_a = imported_a["imported"][0]["entry_id"]
+        entry_id_b = imported_b["imported"][0]["entry_id"]
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry_id_a,
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "shared-token-for-scope appears in conversation A",
+                "created_at": "2026-05-25T12:02:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry_id_b,
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "shared-token-for-scope appears in conversation B",
+                "created_at": "2026-05-25T12:03:00+00:00",
+            },
+        )
+
+        results = search_memory(
+            self.paths,
+            {
+                "query": "shared-token-for-scope",
+                "limit": 10,
+                "source_conversation_id": "telegram:search-scope-a",
+            },
+        )
+        self.assertEqual(len(results["matches"]), 1)
+        self.assertEqual(results["matches"][0]["entry_id"], entry_id_a)
+        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+
+    def test_search_memory_raw_fallback_respects_import_id_and_truthful_only(self) -> None:
+        imported_file_a = self.root / "search-fallback-import-a.jsonl"
+        imported_file_a.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T12:10:00+00:00",
+                    "content": "fallback-needle-unique appears in imported entry A",
+                    "metadata": {"source_message_id": "fallback-a-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        imported_file_b = self.root / "search-fallback-import-b.jsonl"
+        imported_file_b.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T12:11:00+00:00",
+                    "content": "fallback-needle-unique appears in imported entry B",
+                    "metadata": {"source_message_id": "fallback-b-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        imported_a = import_session_jsonl(
+            self.paths,
+            {
+                "path": str(imported_file_a),
+                "import_id": "import-fallback-target",
+                "source_session_id": "session-fallback-a",
+                "source_conversation_id": "telegram:fallback-a",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(imported_file_b),
+                "import_id": "import-fallback-other",
+                "source_session_id": "session-fallback-b",
+                "source_conversation_id": "telegram:fallback-b",
+            },
+        )
+        append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "fallback-needle-unique appears in manual note and should be filtered by truthful_only.",
+                "created_at": "2026-05-25T12:12:00+00:00",
+            },
+        )
+
+        scoped = search_memory(
+            self.paths,
+            {
+                "query": "fallback-needle-unique",
+                "limit": 10,
+                "import_id": "import-fallback-target",
+                "truthful_only": True,
+            },
+        )
+        self.assertEqual(scoped["match_summary"]["compressed_memory_hits"], 0)
+        self.assertTrue(scoped["match_summary"]["using_fallback"])
+        self.assertEqual(len(scoped["matches"]), 1)
+        self.assertEqual(scoped["matches"][0]["entry_id"], imported_a["imported"][0]["entry_id"])
+
+    def test_search_memory_unscoped_behavior_remains_compatible(self) -> None:
+        source_file_a = self.root / "search-unscoped-a.jsonl"
+        source_file_a.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T12:20:00+00:00",
+                    "content": "unscoped-needle-token in imported A",
+                    "metadata": {"source_message_id": "search-unscoped-a-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        source_file_b = self.root / "search-unscoped-b.jsonl"
+        source_file_b.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T12:21:00+00:00",
+                    "content": "unscoped-needle-token in imported B",
+                    "metadata": {"source_message_id": "search-unscoped-b-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_a),
+                "import_id": "import-search-unscoped-a",
+                "source_session_id": "session-search-unscoped-a",
+                "source_conversation_id": "telegram:search-unscoped-a",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_b),
+                "import_id": "import-search-unscoped-b",
+                "source_session_id": "session-search-unscoped-b",
+                "source_conversation_id": "telegram:search-unscoped-b",
+            },
+        )
+
+        results = search_memory(self.paths, {"query": "unscoped-needle-token", "limit": 10})
+        self.assertGreaterEqual(len(results["matches"]), 2)
+
+    def test_cli_search_memory_forwards_provenance_filters(self) -> None:
+        source_file = self.root / "cli-search-scoped.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T12:30:00+00:00",
+                    "content": "cli-search-needle appears in scoped import entry",
+                    "metadata": {"source_message_id": "cli-search-scoped-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        other_file = self.root / "cli-search-other.jsonl"
+        other_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T12:31:00+00:00",
+                    "content": "cli-search-needle appears in other import entry",
+                    "metadata": {"source_message_id": "cli-search-other-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import-cli-search-target",
+                "source_session_id": "session-cli-search-target",
+                "source_conversation_id": "telegram:cli-search-target",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(other_file),
+                "import_id": "import-cli-search-other",
+                "source_session_id": "session-cli-search-other",
+                "source_conversation_id": "telegram:cli-search-other",
+            },
+        )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "search-memory",
+            "--query",
+            "cli-search-needle",
+            "--limit",
+            "20",
+            "--import-id",
+            "import-cli-search-target",
+            "--truthful-only",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["filters"]["import_id"], "import-cli-search-target")
+        self.assertTrue(out["filters"]["truthful_only"])
+        self.assertEqual(len(out["matches"]), 1)
+
     def test_list_entries_returns_human_browse_fields(self) -> None:
         append_entry(
             self.paths,
@@ -748,6 +1169,394 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(sum(1 for a in memories if a.get("is_current")), 1)
         current_memory = [a for a in memories if a.get("is_current")][0]
         self.assertEqual(current_memory["content"], "newer memory")
+        superseded_memory = [a for a in memories if not a.get("is_current")][0]
+        self.assertEqual(superseded_memory["lifecycle_status"], "superseded")
+        self.assertEqual(current_memory["lifecycle_status"], "active")
+
+    def test_fetch_entry_detail_marks_artifact_overlay_stale_when_overlay_is_newer(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Initial note.",
+                "created_at": "2026-05-23T10:00:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "Brief generated before correction.",
+                "created_at": "2026-05-23T10:05:00+00:00",
+                "metadata": {"generated_at": "2026-05-23T10:05:00+00:00"},
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "correction",
+                "author": "operator",
+                "content": "Pending: follow up with corrected timeline.",
+                "created_at": "2026-05-23T10:06:00+00:00",
+            },
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        artifact = [a for a in detail["artifacts"] if a["artifact_type"] == "conversation-brief"][0]
+        self.assertTrue(artifact["overlay_stale"])
+        self.assertEqual(artifact["overlay_stale_reason"], "overlay_added_after_artifact_generation")
+        self.assertEqual(artifact["latest_overlay_at"], "2026-05-23T10:06:00+00:00")
+        self.assertEqual(artifact["artifact_generated_at"], "2026-05-23T10:05:00+00:00")
+
+    def test_fetch_entry_detail_overlay_staleness_false_without_overlays(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "No overlays here.",
+                "created_at": "2026-05-23T11:00:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "Compressed summary.",
+                "created_at": "2026-05-23T11:01:00+00:00",
+            },
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        artifact = [a for a in detail["artifacts"] if a["artifact_type"] == "compressed-memory"][0]
+        self.assertFalse(artifact["overlay_stale"])
+        self.assertIsNone(artifact["latest_overlay_at"])
+
+    def test_fetch_entry_detail_overlay_staleness_false_when_overlay_older_than_artifact(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Base content.",
+                "created_at": "2026-05-23T12:00:00+00:00",
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "annotation",
+                "author": "operator",
+                "content": "Old note from before generation.",
+                "created_at": "2026-05-23T12:01:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "Regenerated after overlay.",
+                "created_at": "2026-05-23T12:02:00+00:00",
+                "metadata": {"generated_at": "2026-05-23T12:02:00+00:00"},
+            },
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        artifact = [a for a in detail["artifacts"] if a["artifact_type"] == "conversation-brief"][0]
+        self.assertFalse(artifact["overlay_stale"])
+        self.assertEqual(artifact["latest_overlay_at"], "2026-05-23T12:01:00+00:00")
+        self.assertEqual(artifact["artifact_generated_at"], "2026-05-23T12:02:00+00:00")
+
+    def test_attach_artifact_marks_prior_same_scope_artifacts_superseded(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: status?\nAssistant: checking now.",
+                "created_at": "2026-05-23T11:30:00+00:00",
+            },
+        )
+        older = attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "older brief",
+                "created_at": "2026-05-23T11:31:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"]},
+            },
+        )
+        newer = attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "newer brief",
+                "created_at": "2026-05-23T11:32:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"]},
+            },
+        )
+
+        older_body = json.loads(Path(older["artifact_file"]).read_text(encoding="utf-8"))
+        newer_body = json.loads(Path(newer["artifact_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(older_body["metadata"]["lifecycle_status"], "superseded")
+        self.assertEqual(older_body["metadata"]["superseded_at"], "2026-05-23T11:32:00+00:00")
+        self.assertEqual(older_body["metadata"]["superseded_by_artifact_id"], newer["artifact_id"])
+        self.assertEqual(newer_body["metadata"]["lifecycle_status"], "active")
+        self.assertTrue(str(newer_body["metadata"].get("generation_key", "")).strip())
+
+    def test_normalize_derived_artifact_lifecycle_marks_one_active_per_scope(self) -> None:
+        e1 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "entry one",
+                "created_at": "2026-05-23T10:00:00+00:00",
+            },
+        )
+        e2 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "entry two",
+                "created_at": "2026-05-23T10:05:00+00:00",
+            },
+        )
+        older = attach_artifact(
+            self.paths,
+            {
+                "entry_id": e1["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "older brief",
+                "created_at": "2026-05-23T10:10:00+00:00",
+                "metadata": {"source_entry_id": e1["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+        newer = attach_artifact(
+            self.paths,
+            {
+                "entry_id": e1["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "newer brief",
+                "created_at": "2026-05-23T10:11:00+00:00",
+                "metadata": {"source_entry_id": e1["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+        anchor = attach_artifact(
+            self.paths,
+            {
+                "entry_id": e2["entry_id"],
+                "artifact_type": "analysis:open-loop",
+                "producer": "open-loop.v1",
+                "content": json.dumps({"loops": [{"title": "older"}]}),
+                "created_at": "2026-05-23T10:12:00+00:00",
+                "metadata": {"source_entry_ids": [e1["entry_id"], e2["entry_id"]], "lifecycle_status": "active"},
+            },
+        )
+        linked_newer = attach_artifact(
+            self.paths,
+            {
+                "entry_id": e1["entry_id"],
+                "artifact_type": "analysis:open-loop",
+                "producer": "open-loop.v1",
+                "content": json.dumps({"loops": [{"title": "newer"}]}),
+                "created_at": "2026-05-23T10:13:00+00:00",
+                "metadata": {"source_entry_ids": [e2["entry_id"], e1["entry_id"]], "lifecycle_status": "active"},
+            },
+        )
+
+        older_body = json.loads(Path(older["artifact_file"]).read_text(encoding="utf-8"))
+        newer_body = json.loads(Path(newer["artifact_file"]).read_text(encoding="utf-8"))
+        anchor_body = json.loads(Path(anchor["artifact_file"]).read_text(encoding="utf-8"))
+        linked_newer_body = json.loads(Path(linked_newer["artifact_file"]).read_text(encoding="utf-8"))
+        # Simulate pre-lifecycle legacy state with ambiguous active markers and missing generation keys.
+        for body, file_path in (
+            (older_body, Path(older["artifact_file"])),
+            (newer_body, Path(newer["artifact_file"])),
+            (anchor_body, Path(anchor["artifact_file"])),
+            (linked_newer_body, Path(linked_newer["artifact_file"])),
+        ):
+            metadata = dict(body.get("metadata") or {})
+            metadata["lifecycle_status"] = "active"
+            metadata.pop("superseded_at", None)
+            metadata.pop("superseded_by_artifact_id", None)
+            metadata.pop("generation_key", None)
+            body["metadata"] = metadata
+            file_path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+
+        result = normalize_derived_artifact_lifecycle(self.paths, {"dry_run": False})
+        self.assertGreaterEqual(result["changed_artifact_count"], 1)
+
+        older_body = json.loads(Path(older["artifact_file"]).read_text(encoding="utf-8"))
+        newer_body = json.loads(Path(newer["artifact_file"]).read_text(encoding="utf-8"))
+        anchor_body = json.loads(Path(anchor["artifact_file"]).read_text(encoding="utf-8"))
+        linked_newer_body = json.loads(Path(linked_newer["artifact_file"]).read_text(encoding="utf-8"))
+        self.assertEqual(newer_body["metadata"]["lifecycle_status"], "active")
+        self.assertEqual(older_body["metadata"]["lifecycle_status"], "superseded")
+        self.assertEqual(older_body["metadata"]["superseded_by_artifact_id"], newer["artifact_id"])
+        self.assertEqual(linked_newer_body["metadata"]["lifecycle_status"], "active")
+        self.assertEqual(anchor_body["metadata"]["lifecycle_status"], "superseded")
+        self.assertEqual(anchor_body["metadata"]["superseded_by_artifact_id"], linked_newer["artifact_id"])
+
+    def test_normalize_derived_artifact_lifecycle_dry_run_does_not_mutate(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "entry",
+                "created_at": "2026-05-23T11:00:00+00:00",
+            },
+        )
+        older = attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "older",
+                "created_at": "2026-05-23T11:01:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "newer",
+                "created_at": "2026-05-23T11:02:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+
+        older_body = json.loads(Path(older["artifact_file"]).read_text(encoding="utf-8"))
+        metadata = dict(older_body.get("metadata") or {})
+        metadata["lifecycle_status"] = "active"
+        metadata.pop("superseded_at", None)
+        metadata.pop("superseded_by_artifact_id", None)
+        metadata.pop("generation_key", None)
+        older_body["metadata"] = metadata
+        Path(older["artifact_file"]).write_text(json.dumps(older_body, indent=2), encoding="utf-8")
+
+        before = Path(older["artifact_file"]).read_text(encoding="utf-8")
+        out = normalize_derived_artifact_lifecycle(self.paths, {"dry_run": True})
+        after = Path(older["artifact_file"]).read_text(encoding="utf-8")
+        self.assertGreaterEqual(out["changed_artifact_count"], 1)
+        self.assertEqual(before, after)
+
+    def test_normalize_derived_artifact_lifecycle_is_idempotent(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "entry",
+                "created_at": "2026-05-23T12:00:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "older",
+                "created_at": "2026-05-23T12:01:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "newer",
+                "created_at": "2026-05-23T12:02:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+
+        for path in (self.paths.artifacts_dir / entry["entry_id"]).glob("artifact_*.json"):
+            body = json.loads(path.read_text(encoding="utf-8"))
+            metadata = dict(body.get("metadata") or {})
+            metadata["lifecycle_status"] = "active"
+            metadata.pop("superseded_at", None)
+            metadata.pop("superseded_by_artifact_id", None)
+            metadata.pop("generation_key", None)
+            body["metadata"] = metadata
+            path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+
+        first = normalize_derived_artifact_lifecycle(self.paths, {"dry_run": False})
+        second = normalize_derived_artifact_lifecycle(self.paths, {"dry_run": False})
+        self.assertGreaterEqual(first["changed_artifact_count"], 1)
+        self.assertEqual(second["changed_artifact_count"], 0)
+
+    def test_normalize_derived_artifact_lifecycle_does_not_touch_raw_entries(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "raw truth must stay unchanged",
+                "created_at": "2026-05-23T13:00:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "older",
+                "created_at": "2026-05-23T13:01:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "newer",
+                "created_at": "2026-05-23T13:02:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"], "lifecycle_status": "active"},
+            },
+        )
+
+        raw_file = Path(fetch_raw_entry(self.paths, {"entry_id": entry["entry_id"]})["entry_file"])
+        before = raw_file.read_text(encoding="utf-8")
+        normalize_derived_artifact_lifecycle(self.paths, {"dry_run": False})
+        after = raw_file.read_text(encoding="utf-8")
+        self.assertEqual(before, after)
 
     def test_fetch_entry_detail_includes_open_loop_payload_for_analysis_artifact(self) -> None:
         e1 = append_entry(
@@ -917,6 +1726,109 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertTrue(item["brief"])
         self.assertIn("Bill", item["brief"])
 
+    def test_produce_conversation_briefs_skips_when_active_artifact_exists(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: status update?\nAssistant: all good.",
+                "created_at": "2026-05-23T12:10:00+00:00",
+            },
+        )
+        first = produce_conversation_briefs(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(first["produced_count"], 1)
+        second = produce_conversation_briefs(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(second["produced_count"], 0)
+        self.assertEqual(second["skipped"], [entry["entry_id"]])
+
+    def test_produce_conversation_briefs_regenerates_when_only_superseded_exists(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: status update?\nAssistant: all good.",
+                "created_at": "2026-05-23T12:20:00+00:00",
+            },
+        )
+        attached = attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "conversation-brief",
+                "producer": "conversation-brief.v1",
+                "content": "old brief",
+                "created_at": "2026-05-23T12:21:00+00:00",
+                "metadata": {"source_entry_id": entry["entry_id"]},
+            },
+        )
+        body = json.loads(Path(attached["artifact_file"]).read_text(encoding="utf-8"))
+        metadata = dict(body.get("metadata") or {})
+        metadata["lifecycle_status"] = "superseded"
+        metadata["superseded_at"] = "2026-05-23T12:22:00+00:00"
+        metadata["superseded_by_artifact_id"] = "artifact_newer"
+        body["metadata"] = metadata
+        Path(attached["artifact_file"]).write_text(json.dumps(body, indent=2), encoding="utf-8")
+
+        out = produce_conversation_briefs(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(out["produced_count"], 1)
+        self.assertEqual(out["skipped_count"], 0)
+
+    def test_produce_compressed_memory_legacy_artifact_without_lifecycle_still_skips(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: check browser node\nAssistant: checking.",
+                "created_at": "2026-05-23T12:30:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "legacy memory body",
+                "created_at": "2026-05-23T12:31:00+00:00",
+                "metadata": {},
+            },
+        )
+        # Simulate legacy artifact with no lifecycle metadata.
+        artifact_files = sorted((self.paths.artifacts_dir / entry["entry_id"]).glob("*.json"))
+        self.assertEqual(len(artifact_files), 1)
+        body = json.loads(artifact_files[0].read_text(encoding="utf-8"))
+        metadata = dict(body.get("metadata") or {})
+        metadata.pop("lifecycle_status", None)
+        metadata.pop("generation_key", None)
+        body["metadata"] = metadata
+        artifact_files[0].write_text(json.dumps(body, indent=2), encoding="utf-8")
+
+        out = produce_compressed_memory(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(out["produced_count"], 0)
+        self.assertEqual(out["skipped"], [entry["entry_id"]])
+
+    def test_produce_compressed_memory_force_generates_even_with_active_artifact(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "telegram-direct-transcript",
+                "author_role": "mixed",
+                "content": "Willardmechem: check browser node\nAssistant: checking.",
+                "created_at": "2026-05-23T12:40:00+00:00",
+            },
+        )
+        first = produce_compressed_memory(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertEqual(first["produced_count"], 1)
+        second = produce_compressed_memory(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5, "force": True})
+        self.assertEqual(second["produced_count"], 1)
+
     def test_produce_compressed_memory_indexes_artifact_and_search_hits_compressed_layer(self) -> None:
         entry = append_entry(
             self.paths,
@@ -1024,6 +1936,93 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         produced = produce_open_loops(self.paths, {"limit": 10})
         self.assertGreaterEqual(produced["loop_count"], 1)
+
+    def test_produce_open_loops_detects_overlay_added_unresolved_item(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Status note without explicit open-loop markers.",
+                "created_at": "2026-05-24T09:15:00+00:00",
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "correction",
+                "author": "operator",
+                "content": "TODO: follow up with customer on contract signature timing.",
+            },
+        )
+
+        produced = produce_open_loops(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        self.assertGreaterEqual(produced["loop_count"], 1)
+
+    def test_produce_open_loops_with_overlay_does_not_mutate_raw_content(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "mixed",
+                "content": "Willardmechem: capture baseline record only.",
+                "created_at": "2026-05-24T09:20:00+00:00",
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "annotation",
+                "author": "operator",
+                "content": "Pending question: who owns follow-up next step?",
+            },
+        )
+        before = fetch_raw_entry(self.paths, {"entry_id": entry["entry_id"]})["entry"]["content"]
+        produce_open_loops(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5})
+        after = fetch_raw_entry(self.paths, {"entry_id": entry["entry_id"]})["entry"]["content"]
+        self.assertEqual(before, after)
+
+    def test_produce_open_loops_overlay_path_preserves_lineage_source_entry_ids(self) -> None:
+        e1 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "mixed",
+                "content": "Baseline entry one without clear unresolved marker.",
+                "created_at": "2026-05-24T09:25:00+00:00",
+            },
+        )
+        e2 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "mixed",
+                "content": "Baseline entry two with neutral text.",
+                "created_at": "2026-05-24T09:26:00+00:00",
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": e2["entry_id"],
+                "overlay_type": "annotation",
+                "author": "operator",
+                "content": "TODO: pending item remains for tomorrow follow-up.",
+            },
+        )
+
+        produced = produce_open_loops(self.paths, {"entry_ids": [e1["entry_id"], e2["entry_id"]], "limit": 10})
+        self.assertGreaterEqual(produced["loop_count"], 1)
+        artifact_file = Path(produced["artifact_file"])
+        body = json.loads(artifact_file.read_text(encoding="utf-8"))
+        metadata = body.get("metadata", {})
+        self.assertEqual(sorted(metadata.get("source_entry_ids", [])), sorted([e1["entry_id"], e2["entry_id"]]))
         artifact_file = Path(produced["artifact_file"])
         self.assertTrue(artifact_file.exists())
 
@@ -1476,6 +2475,660 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(second["imported_count"], 0)
         self.assertEqual(second["skipped_count"], 1)
         self.assertEqual(second["skipped"][0]["reason"], "duplicate_source_item")
+
+    def test_list_entries_filters_by_source_conversation_id(self) -> None:
+        source_file_a = self.root / "conversation-a.jsonl"
+        source_file_a.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T13:10:00+00:00",
+                    "content": "Conversation A message.",
+                    "metadata": {"source_message_id": "conv-a-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        source_file_b = self.root / "conversation-b.jsonl"
+        source_file_b.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T13:11:00+00:00",
+                    "content": "Conversation B message.",
+                    "metadata": {"source_message_id": "conv-b-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_a),
+                "import_id": "import-conv-a",
+                "source_session_id": "session-a",
+                "source_conversation_id": "telegram:conv-a",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_b),
+                "import_id": "import-conv-b",
+                "source_session_id": "session-b",
+                "source_conversation_id": "telegram:conv-b",
+            },
+        )
+        append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Manual entry should not match scoped import filters.",
+                "created_at": "2026-05-25T13:12:00+00:00",
+            },
+        )
+
+        out = list_entries(self.paths, {"limit": 10, "offset": 0, "source_conversation_id": "telegram:conv-a"})
+        self.assertEqual(len(out["items"]), 1)
+        self.assertEqual(out["items"][0]["provenance"]["source_conversation_id"], "telegram:conv-a")
+        self.assertEqual(out["items"][0]["provenance"]["import_id"], "import-conv-a")
+
+    def test_list_entries_filters_by_import_id(self) -> None:
+        source_file = self.root / "import-id-filter.jsonl"
+        source_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "entry_type": "chat_log",
+                            "source": "telegram-direct-import",
+                            "author_role": "human",
+                            "created_at": "2026-05-25T13:20:00+00:00",
+                            "content": "Import target one.",
+                            "metadata": {"source_message_id": "import-filter-1"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "entry_type": "chat_log",
+                            "source": "telegram-direct-import",
+                            "author_role": "agent",
+                            "created_at": "2026-05-25T13:21:00+00:00",
+                            "content": "Import target two.",
+                            "metadata": {"source_message_id": "import-filter-2"},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import-filter-target",
+                "source_session_id": "session-filter",
+                "source_conversation_id": "telegram:filter",
+            },
+        )
+        append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Manual note outside import batch.",
+                "created_at": "2026-05-25T13:22:00+00:00",
+            },
+        )
+
+        out = list_entries(self.paths, {"limit": 10, "offset": 0, "import_id": "import-filter-target"})
+        self.assertEqual(len(out["items"]), 2)
+        self.assertEqual({item["provenance"]["import_id"] for item in out["items"]}, {"import-filter-target"})
+
+    def test_list_entries_truthful_only_excludes_manual_entries(self) -> None:
+        source_file = self.root / "truthful-only.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T13:30:00+00:00",
+                    "content": "Truthy import message.",
+                    "metadata": {"source_message_id": "truthful-only-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import-truthful-only",
+                "source_session_id": "session-truthful",
+                "source_conversation_id": "telegram:truthful",
+            },
+        )
+        append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Manual note should be excluded by truthful_only.",
+                "created_at": "2026-05-25T13:31:00+00:00",
+            },
+        )
+
+        out = list_entries(self.paths, {"limit": 10, "offset": 0, "truthful_only": True})
+        self.assertEqual(len(out["items"]), 1)
+        self.assertTrue(out["items"][0]["provenance"]["truthful_source"])
+        self.assertEqual(out["items"][0]["provenance"]["import_id"], "import-truthful-only")
+
+    def test_list_entries_unfiltered_remains_compatible_and_includes_provenance_hints(self) -> None:
+        source_file = self.root / "unfiltered-provenance.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T13:40:00+00:00",
+                    "content": "Imported message for unfiltered list.",
+                    "metadata": {"source_message_id": "unfiltered-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import-unfiltered",
+                "source_session_id": "session-unfiltered",
+                "source_conversation_id": "telegram:unfiltered",
+            },
+        )
+        append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Manual unfiltered entry.",
+                "created_at": "2026-05-25T13:41:00+00:00",
+            },
+        )
+
+        out = list_entries(self.paths, {"limit": 10, "offset": 0})
+        self.assertGreaterEqual(len(out["items"]), 2)
+        by_source = {item["source"]: item for item in out["items"]}
+        imported_item = by_source["telegram-direct-import"]
+        manual_item = by_source["cli"]
+        self.assertEqual(imported_item["provenance"]["import_id"], "import-unfiltered")
+        self.assertEqual(imported_item["provenance"]["source_conversation_id"], "telegram:unfiltered")
+        self.assertIsNone(manual_item["provenance"]["import_id"])
+        self.assertFalse(manual_item["provenance"]["truthful_source"])
+
+    def test_cli_list_entries_forwards_provenance_filters(self) -> None:
+        source_file = self.root / "cli-list-entries-filtered.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T13:50:00+00:00",
+                    "content": "CLI scoped import message.",
+                    "metadata": {"source_message_id": "cli-filter-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import-cli-filter",
+                "source_session_id": "session-cli-filter",
+                "source_conversation_id": "telegram:cli-filter",
+            },
+        )
+        append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Manual note outside truthful import scope.",
+                "created_at": "2026-05-25T13:51:00+00:00",
+            },
+        )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "list-entries",
+            "--limit",
+            "20",
+            "--offset",
+            "0",
+            "--source-conversation-id",
+            "telegram:cli-filter",
+            "--import-id",
+            "import-cli-filter",
+            "--truthful-only",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        out = json.loads(completed.stdout)
+        self.assertEqual(len(out["items"]), 1)
+        item = out["items"][0]
+        self.assertEqual(item["source"], "telegram-direct-import")
+        self.assertEqual(item["provenance"]["source_conversation_id"], "telegram:cli-filter")
+        self.assertEqual(item["provenance"]["import_id"], "import-cli-filter")
+        self.assertTrue(item["provenance"]["truthful_source"])
+
+    def test_produce_open_loops_scopes_by_source_conversation_id(self) -> None:
+        source_file_a = self.root / "produce-loops-conv-a.jsonl"
+        source_file_a.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:00:00+00:00",
+                    "content": "Willardmechem: can you check the browser route?\nAssistant: yes, checking now.",
+                    "metadata": {"source_message_id": "loops-conv-a-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        source_file_b = self.root / "produce-loops-conv-b.jsonl"
+        source_file_b.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:01:00+00:00",
+                    "content": "Willardmechem: this is another conversation scope.",
+                    "metadata": {"source_message_id": "loops-conv-b-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_a),
+                "import_id": "import-loops-conv-a",
+                "source_session_id": "session-loops-a",
+                "source_conversation_id": "telegram:loops-conv-a",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_b),
+                "import_id": "import-loops-conv-b",
+                "source_session_id": "session-loops-b",
+                "source_conversation_id": "telegram:loops-conv-b",
+            },
+        )
+
+        produced = produce_open_loops(
+            self.paths,
+            {"limit": 10, "source_conversation_id": "telegram:loops-conv-a"},
+        )
+        self.assertEqual(produced["selection_mode"], "provenance_scope")
+        self.assertEqual(produced["filters"]["source_conversation_id"], "telegram:loops-conv-a")
+        self.assertEqual(len(produced["source_entry_ids"]), 1)
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": produced["source_entry_ids"][0]})
+        self.assertEqual(
+            detail["raw_entry"]["metadata"]["ingestion"]["source_conversation_id"],
+            "telegram:loops-conv-a",
+        )
+
+    def test_produce_compressed_memory_scopes_by_import_id(self) -> None:
+        source_file_a = self.root / "produce-memory-import-a.jsonl"
+        source_file_a.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:10:00+00:00",
+                    "content": "Willardmechem: note for import A scope.",
+                    "metadata": {"source_message_id": "memory-import-a-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        source_file_b = self.root / "produce-memory-import-b.jsonl"
+        source_file_b.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:11:00+00:00",
+                    "content": "Willardmechem: note for import B scope.",
+                    "metadata": {"source_message_id": "memory-import-b-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_a),
+                "import_id": "import-memory-target",
+                "source_session_id": "session-memory-a",
+                "source_conversation_id": "telegram:memory-a",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file_b),
+                "import_id": "import-memory-other",
+                "source_session_id": "session-memory-b",
+                "source_conversation_id": "telegram:memory-b",
+            },
+        )
+
+        out = produce_compressed_memory(self.paths, {"limit": 10, "import_id": "import-memory-target"})
+        self.assertEqual(out["selection_mode"], "provenance_scope")
+        self.assertEqual(out["filters"]["import_id"], "import-memory-target")
+        self.assertEqual(out["produced_count"], 1)
+        self.assertEqual(out["skipped_count"], 0)
+        entry_id = out["produced"][0]["entry_id"]
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry_id})
+        self.assertEqual(detail["raw_entry"]["metadata"]["ingestion"]["import_id"], "import-memory-target")
+
+    def test_produce_conversation_briefs_truthful_only_excludes_manual_entries(self) -> None:
+        source_file = self.root / "produce-brief-truthful-only.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:20:00+00:00",
+                    "content": "Willardmechem: imported truthful message for brief scope.",
+                    "metadata": {"source_message_id": "brief-truthful-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import-brief-truthful",
+                "source_session_id": "session-brief-truthful",
+                "source_conversation_id": "telegram:brief-truthful",
+            },
+        )
+        manual = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Manual note that should not be briefed by truthful_only scope.",
+                "created_at": "2026-05-25T14:21:00+00:00",
+            },
+        )
+
+        out = produce_conversation_briefs(self.paths, {"limit": 10, "truthful_only": True})
+        produced_ids = {item["entry_id"] for item in out["produced"]}
+        self.assertEqual(out["selection_mode"], "provenance_scope")
+        self.assertNotIn(manual["entry_id"], produced_ids)
+        self.assertGreaterEqual(out["produced_count"], 1)
+
+    def test_produce_compressed_memory_uses_overlay_effective_content(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "mixed",
+                "content": "Willardmechem: baseline discussion without unique token.",
+                "created_at": "2026-05-25T14:25:00+00:00",
+            },
+        )
+        append_overlay(
+            self.paths,
+            {
+                "entry_id": entry["entry_id"],
+                "overlay_type": "annotation",
+                "author": "operator",
+                "content": "Correction context adds token delta-router-overlay for downstream memory.",
+            },
+        )
+        out = produce_compressed_memory(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5, "force": True})
+        self.assertEqual(out["produced_count"], 1)
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        memory_artifacts = [a for a in detail["artifacts"] if a["artifact_type"] == "compressed-memory"]
+        self.assertGreaterEqual(len(memory_artifacts), 1)
+        self.assertIn("delta-router-overlay", memory_artifacts[0]["content"])
+
+    def test_entries_without_overlays_remain_compatible_for_fallback_and_producers(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "mixed",
+                "content": "No overlays here, but token stable-compat-token appears in raw text.",
+                "created_at": "2026-05-25T14:26:00+00:00",
+            },
+        )
+        fallback = search_memory(self.paths, {"query": "stable-compat-token", "limit": 5})
+        self.assertEqual(fallback["matches"][0]["entry_id"], entry["entry_id"])
+
+        produced = produce_conversation_briefs(self.paths, {"entry_ids": [entry["entry_id"]], "limit": 5, "force": True})
+        self.assertEqual(produced["produced_count"], 1)
+
+    def test_producer_entry_ids_override_provenance_filters(self) -> None:
+        scoped_file = self.root / "producer-entry-override-scoped.jsonl"
+        scoped_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:30:00+00:00",
+                    "content": "Scoped imported entry.",
+                    "metadata": {"source_message_id": "producer-override-scoped"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(scoped_file),
+                "import_id": "import-producer-override",
+                "source_session_id": "session-producer-override",
+                "source_conversation_id": "telegram:producer-override",
+            },
+        )
+        manual = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "mixed",
+                "content": "Manual explicit entry id target.",
+                "created_at": "2026-05-25T14:31:00+00:00",
+            },
+        )
+
+        out = produce_conversation_briefs(
+            self.paths,
+            {
+                "limit": 10,
+                "entry_ids": [manual["entry_id"]],
+                "source_conversation_id": "telegram:producer-override",
+            },
+        )
+        self.assertEqual(out["selection_mode"], "entry_ids")
+        self.assertEqual(out["produced_count"], 1)
+        self.assertEqual(out["produced"][0]["entry_id"], manual["entry_id"])
+
+    def test_produce_compressed_memory_unscoped_behavior_remains_compatible(self) -> None:
+        imported_file = self.root / "producer-unscoped-imported.jsonl"
+        imported_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:40:00+00:00",
+                    "content": "Unscoped imported entry.",
+                    "metadata": {"source_message_id": "producer-unscoped-imported"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(imported_file),
+                "import_id": "import-producer-unscoped",
+                "source_session_id": "session-producer-unscoped",
+                "source_conversation_id": "telegram:producer-unscoped",
+            },
+        )
+        manual = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "cli",
+                "author_role": "mixed",
+                "content": "Unscoped manual entry.",
+                "created_at": "2026-05-25T14:41:00+00:00",
+            },
+        )
+
+        out = produce_compressed_memory(self.paths, {"limit": 10, "force": True})
+        self.assertEqual(out["selection_mode"], "unscoped")
+        produced_ids = {item["entry_id"] for item in out["produced"]}
+        self.assertIn(manual["entry_id"], produced_ids)
+        self.assertGreaterEqual(out["produced_count"], 2)
+
+    def test_cli_produce_compressed_memory_forwards_provenance_filters(self) -> None:
+        target_file = self.root / "cli-producer-scope-target.jsonl"
+        target_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:50:00+00:00",
+                    "content": "CLI scoped producer target message.",
+                    "metadata": {"source_message_id": "cli-producer-target-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        other_file = self.root / "cli-producer-scope-other.jsonl"
+        other_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "mixed",
+                    "created_at": "2026-05-25T14:51:00+00:00",
+                    "content": "CLI scoped producer non-target message.",
+                    "metadata": {"source_message_id": "cli-producer-other-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(target_file),
+                "import_id": "import-cli-producer-target",
+                "source_session_id": "session-cli-producer-target",
+                "source_conversation_id": "telegram:cli-producer-target",
+            },
+        )
+        import_session_jsonl(
+            self.paths,
+            {
+                "path": str(other_file),
+                "import_id": "import-cli-producer-other",
+                "source_session_id": "session-cli-producer-other",
+                "source_conversation_id": "telegram:cli-producer-other",
+            },
+        )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "produce-compressed-memory",
+            "--limit",
+            "20",
+            "--import-id",
+            "import-cli-producer-target",
+            "--truthful-only",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["selection_mode"], "provenance_scope")
+        self.assertEqual(out["filters"]["import_id"], "import-cli-producer-target")
+        self.assertEqual(out["produced_count"], 1)
 
     def test_import_session_and_refresh_derived_runs_core_producers_for_imported_entries(self) -> None:
         source_file = self.root / "import-and-analyze.jsonl"
@@ -2368,6 +4021,93 @@ class AppendEntrySliceTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_telegram_direct_import_fixture(self, inbound_path: Path, sessions_root: Path) -> None:
+        inbound_path.write_text(
+            json.dumps(
+                {
+                    "key": "default:713733361:7001",
+                    "node": {
+                        "sourceMessage": {
+                            "message_id": 7001,
+                            "from": {"id": 713733361, "is_bot": False, "username": "Willardmechem"},
+                            "chat": {"id": 713733361, "type": "private"},
+                            "date": 1778925595,
+                            "text": "hello tom",
+                        }
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        session_file = sessions_root / "run-1.jsonl"
+        session_file.write_text(
+            "\n".join(
+                [
+                    json.dumps({"type": "session", "id": "sess-1", "timestamp": "2026-05-16T10:00:00Z", "cwd": "/tmp"}),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-record",
+                            "parentId": "prev",
+                            "timestamp": "2026-05-16T10:00:10Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-1",
+                                        "name": "message",
+                                        "arguments": {"action": "send", "message": "hi bill"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-record",
+                            "parentId": "assistant-call-record",
+                            "timestamp": "2026-05-16T10:00:11Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-1",
+                                "toolName": "message",
+                                "content": [
+                                    {
+                                        "type": "toolResult",
+                                        "content": json.dumps({"ok": True, "messageId": "7002", "chatId": "713733361"}),
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _write_trajectory_fixture(self, path: Path, *, session_key: str, ts: str, session_file: Path, session_id: str) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session.started",
+                    "ts": ts,
+                    "sessionId": session_id,
+                    "sessionKey": session_key,
+                    "data": {
+                        "sessionFile": str(session_file.resolve()),
+                        "threadId": "telegram-direct-thread",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     def test_import_openclaw_session_command_imports_fixture(self) -> None:
         source_file = self.root / "openclaw-session.jsonl"
         self._write_openclaw_session_fixture(source_file)
@@ -2426,6 +4166,323 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(fetched["entry"]["metadata"]["ingestion"]["truthful_source"], True)
         self.assertEqual(fetched["entry"]["metadata"]["ingestion"]["import_mode"], "session_jsonl")
         self.assertEqual(fetched["entry"]["metadata"]["ingestion"]["source_session_id"], "session-plain-1")
+
+    def test_import_telegram_direct_command_imports_fixture(self) -> None:
+        inbound = self.root / "telegram-messages-import.jsonl"
+        sessions_root = self.root / "sessions-import"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--chat-id",
+            "713733361",
+            "--source",
+            "telegram-direct-import",
+            "--import-id",
+            "import-telegram-direct-test",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+
+        out = json.loads(completed.stdout)
+        self.assertFalse(out["dry_run"])
+        self.assertEqual(out["resolved_source_session_id"], "telegram-direct:713733361")
+        self.assertEqual(out["resolved_source_conversation_id"], "telegram:713733361")
+        self.assertEqual(out["transcript_message_count"], 2)
+        self.assertEqual(out["session_chunk_count"], 1)
+        self.assertEqual(out["imported_count"], 1)
+        self.assertEqual(out["skipped_duplicate_count"], 0)
+        self.assertEqual(out["import_id"], "import-telegram-direct-test")
+        self.assertEqual(out["import_result"]["imported_count"], 1)
+        self.assertEqual(out["import_result"]["skipped_count"], 0)
+        self.assertIsInstance(out["batch_manifest_path"], str)
+        self.assertTrue(out["batch_manifest_path"].endswith("import-telegram-direct-test.json"))
+
+        entry_id = out["import_result"]["imported"][0]["entry_id"]
+        fetched = fetch_raw_entry(self.paths, {"entry_id": entry_id})
+        ingestion = fetched["entry"]["metadata"]["ingestion"]
+        self.assertEqual(ingestion["truthful_source"], True)
+        self.assertEqual(ingestion["source_session_id"], "telegram-direct:713733361")
+        self.assertEqual(ingestion["source_conversation_id"], "telegram:713733361")
+
+    def test_import_telegram_direct_command_dry_run_does_not_write_raw_entries(self) -> None:
+        inbound = self.root / "telegram-messages-dry-run.jsonl"
+        sessions_root = self.root / "sessions-dry-run"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--chat-id",
+            "713733361",
+            "--dry-run",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        out = json.loads(completed.stdout)
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(out["transcript_message_count"], 2)
+        self.assertEqual(out["session_chunk_count"], 1)
+        self.assertEqual(out["imported_count"], 1)
+        self.assertEqual(out["skipped_duplicate_count"], 0)
+        self.assertEqual(list_entries(self.paths, {"limit": 10, "offset": 0})["items"], [])
+
+    def test_import_telegram_direct_command_skips_duplicates_on_repeat_run(self) -> None:
+        inbound = self.root / "telegram-messages-repeat.jsonl"
+        sessions_root = self.root / "sessions-repeat"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--chat-id",
+            "713733361",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        first = subprocess.run(base_cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        second = subprocess.run(base_cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        first_out = json.loads(first.stdout)
+        second_out = json.loads(second.stdout)
+        self.assertEqual(first_out["imported_count"], 1)
+        self.assertEqual(first_out["skipped_duplicate_count"], 0)
+        self.assertEqual(second_out["imported_count"], 0)
+        self.assertEqual(second_out["skipped_duplicate_count"], 1)
+
+    def test_import_telegram_direct_command_explicit_ids_are_surfaced(self) -> None:
+        inbound = self.root / "telegram-messages-ids.jsonl"
+        sessions_root = self.root / "sessions-ids"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--chat-id",
+            "713733361",
+            "--source-session-id",
+            "telegram-direct:custom",
+            "--source-conversation-id",
+            "telegram:custom",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["resolved_source_session_id"], "telegram-direct:custom")
+        self.assertEqual(out["resolved_source_conversation_id"], "telegram:custom")
+
+    def test_backfill_telegram_direct_command_dry_run_discovers_without_writing_entries(self) -> None:
+        inbound = self.root / "telegram-messages-backfill-dry.jsonl"
+        sessions_root = self.root / "sessions-backfill-dry"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+        trajectories_root = self.root / "trajectories-backfill-dry"
+        trajectories_root.mkdir(parents=True, exist_ok=True)
+        self._write_trajectory_fixture(
+            trajectories_root / "one.trajectory.jsonl",
+            session_key="agent:main:telegram:default:direct:713733361",
+            ts="2026-05-16T10:00:00Z",
+            session_file=sessions_root / "run-1.jsonl",
+            session_id="sess-1",
+        )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "backfill-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--trajectories-root",
+            str(trajectories_root),
+            "--session-key",
+            "agent:main:telegram:default:direct:713733361",
+            "--chat-id",
+            "713733361",
+            "--dry-run",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        out = json.loads(completed.stdout)
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(out["discovered_session_file_count"], 1)
+        self.assertEqual(out["processed_session_file_count"], 1)
+        self.assertEqual(out["missing_session_files"], [])
+        self.assertEqual(out["transcript_message_count"], 2)
+        self.assertEqual(out["session_chunk_count"], 1)
+        self.assertEqual(out["imported_count"], 1)
+        self.assertEqual(out["skipped_duplicate_count"], 0)
+        self.assertEqual(list_entries(self.paths, {"limit": 10, "offset": 0})["items"], [])
+
+    def test_backfill_telegram_direct_command_imports_and_repeat_skips_duplicates(self) -> None:
+        inbound = self.root / "telegram-messages-backfill-repeat.jsonl"
+        sessions_root = self.root / "sessions-backfill-repeat"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+        trajectories_root = self.root / "trajectories-backfill-repeat"
+        trajectories_root.mkdir(parents=True, exist_ok=True)
+        self._write_trajectory_fixture(
+            trajectories_root / "one.trajectory.jsonl",
+            session_key="agent:main:telegram:default:direct:713733361",
+            ts="2026-05-16T10:00:00Z",
+            session_file=sessions_root / "run-1.jsonl",
+            session_id="sess-1",
+        )
+
+        base_cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "backfill-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--trajectories-root",
+            str(trajectories_root),
+            "--session-key",
+            "agent:main:telegram:default:direct:713733361",
+            "--chat-id",
+            "713733361",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        first = subprocess.run(base_cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        second = subprocess.run(base_cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        first_out = json.loads(first.stdout)
+        second_out = json.loads(second.stdout)
+        self.assertEqual(first_out["imported_count"], 1)
+        self.assertEqual(first_out["skipped_duplicate_count"], 0)
+        self.assertEqual(second_out["imported_count"], 0)
+        self.assertEqual(second_out["skipped_duplicate_count"], 1)
+
+    def test_backfill_telegram_direct_command_scoping_excludes_non_matching_session_files(self) -> None:
+        inbound = self.root / "telegram-messages-backfill-scope.jsonl"
+        sessions_root = self.root / "sessions-backfill-scope"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+        extra_session = sessions_root / "run-2.jsonl"
+        extra_session.write_text((sessions_root / "run-1.jsonl").read_text(encoding="utf-8"), encoding="utf-8")
+        trajectories_root = self.root / "trajectories-backfill-scope"
+        trajectories_root.mkdir(parents=True, exist_ok=True)
+        self._write_trajectory_fixture(
+            trajectories_root / "one.trajectory.jsonl",
+            session_key="agent:main:telegram:default:direct:713733361",
+            ts="2026-05-16T10:00:00Z",
+            session_file=sessions_root / "run-1.jsonl",
+            session_id="sess-1",
+        )
+        self._write_trajectory_fixture(
+            trajectories_root / "two.trajectory.jsonl",
+            session_key="agent:main:telegram:default:direct:DIFFERENT",
+            ts="2026-05-16T10:00:00Z",
+            session_file=extra_session,
+            session_id="sess-2",
+        )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "backfill-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--trajectories-root",
+            str(trajectories_root),
+            "--session-key",
+            "agent:main:telegram:default:direct:713733361",
+            "--chat-id",
+            "713733361",
+            "--dry-run",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["discovered_session_file_count"], 1)
+        self.assertEqual(out["processed_session_file_count"], 1)
+        self.assertEqual(len(out["items"]), 1)
+        self.assertTrue(out["items"][0]["session_file"].endswith("run-1.jsonl"))
+
+    def test_backfill_telegram_direct_command_reports_missing_session_files(self) -> None:
+        inbound = self.root / "telegram-messages-backfill-missing.jsonl"
+        sessions_root = self.root / "sessions-backfill-missing"
+        self._write_telegram_direct_import_fixture(inbound, sessions_root)
+        missing_path = sessions_root / "missing-run.jsonl"
+        trajectories_root = self.root / "trajectories-backfill-missing"
+        trajectories_root.mkdir(parents=True, exist_ok=True)
+        self._write_trajectory_fixture(
+            trajectories_root / "missing.trajectory.jsonl",
+            session_key="agent:main:telegram:default:direct:713733361",
+            ts="2026-05-16T10:00:00Z",
+            session_file=missing_path,
+            session_id="sess-missing",
+        )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "backfill-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--trajectories-root",
+            str(trajectories_root),
+            "--session-key",
+            "agent:main:telegram:default:direct:713733361",
+            "--chat-id",
+            "713733361",
+            "--dry-run",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["discovered_session_file_count"], 1)
+        self.assertEqual(out["processed_session_file_count"], 0)
+        self.assertEqual(len(out["missing_session_files"]), 1)
+        self.assertTrue(out["missing_session_files"][0].endswith("missing-run.jsonl"))
+        self.assertEqual(out["imported_count"], 0)
+        self.assertEqual(out["skipped_duplicate_count"], 0)
 
     def test_import_openclaw_session_command_dry_run_does_not_write_raw_entries(self) -> None:
         source_file = self.root / "openclaw-session-dry-run.jsonl"

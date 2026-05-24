@@ -399,9 +399,20 @@ def _parse_tool_result_payload(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _assistant_sent_messages_from_session_files(*, sessions_root: Path, chat_id: str) -> list[dict[str, Any]]:
+def _assistant_sent_messages_from_session_files(
+    *,
+    sessions_root: Path,
+    chat_id: str,
+    session_files: list[Path] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for path in sorted(sessions_root.glob("*.jsonl")):
+    if session_files is None:
+        candidate_files = sorted(sessions_root.glob("*.jsonl"))
+    else:
+        candidate_files = sorted({Path(path).expanduser().resolve() for path in session_files})
+    for path in candidate_files:
+        if not path.exists():
+            continue
         pending: dict[str, dict[str, Any]] = {}
         with path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -505,6 +516,9 @@ def build_openclaw_telegram_direct_transcript(
     chat_id: str,
     source_session_id: str | None = None,
     source_conversation_id: str | None = None,
+    session_files: list[Path] | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     first_inbound_at: datetime | None = None
@@ -531,6 +545,10 @@ def build_openclaw_telegram_direct_transcript(
             content = _require_content(source_message, line_hint=f"line {line_number}")
             created_at = _iso_from_unix_seconds(source_message.get("date"), line_hint=f"line {line_number}")
             created_at_dt = _parse_iso_datetime(created_at, line_hint=f"line {line_number}")
+            if since and created_at_dt < since:
+                continue
+            if until and created_at_dt >= until:
+                continue
             message_id = _non_empty_str(source_message.get("message_id"))
             metadata = {
                 "transport": "telegram",
@@ -559,7 +577,11 @@ def build_openclaw_telegram_direct_transcript(
             if first_inbound_at is None or created_at_dt < first_inbound_at:
                 first_inbound_at = created_at_dt
 
-    outbound_rows = _assistant_sent_messages_from_session_files(sessions_root=sessions_root, chat_id=chat_id)
+    outbound_rows = _assistant_sent_messages_from_session_files(
+        sessions_root=sessions_root,
+        chat_id=chat_id,
+        session_files=session_files,
+    )
     if first_inbound_at is not None:
         filtered_outbound_rows: list[dict[str, Any]] = []
         for row in outbound_rows:
@@ -567,6 +589,10 @@ def build_openclaw_telegram_direct_transcript(
                 row["message"]["created_at"],
                 line_hint=row["line_hint"],
             )
+            if since and outbound_at < since:
+                continue
+            if until and outbound_at >= until:
+                continue
             if outbound_at < first_inbound_at:
                 continue
             filtered_outbound_rows.append(row)

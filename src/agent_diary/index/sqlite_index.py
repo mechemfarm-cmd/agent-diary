@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import sqlite3
 from pathlib import Path
 
@@ -38,7 +39,7 @@ CREATE TABLE IF NOT EXISTS memory_index (
 
 def bootstrap_sqlite(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.executescript(SCHEMA)
         cols = {row[1] for row in conn.execute("PRAGMA table_info(memory_index)").fetchall()}
         if "created_at" not in cols:

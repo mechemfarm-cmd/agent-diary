@@ -2,6 +2,10 @@ const state = {
   apiBase: "http://127.0.0.1:8041",
   limit: 100,
   offset: 0,
+  sourceConversationId: "",
+  sourceSessionId: "",
+  importId: "",
+  truthfulOnly: false,
   selectedEntryId: null,
   searchQuery: "",
   selectedSearchHitEntryId: null,
@@ -12,8 +16,11 @@ const apiBaseInput = document.getElementById("apiBase");
 const reloadBtn = document.getElementById("reloadBtn");
 const prevPageBtn = document.getElementById("prevPageBtn");
 const nextPageBtn = document.getElementById("nextPageBtn");
+const refreshImportsBtn = document.getElementById("refreshImportsBtn");
 const timelineList = document.getElementById("timelineList");
 const timelineStatus = document.getElementById("timelineStatus");
+const importsStatus = document.getElementById("importsStatus");
+const importsList = document.getElementById("importsList");
 const detailMeta = document.getElementById("detailMeta");
 const detailBody = document.getElementById("detailBody");
 const detailStatus = document.getElementById("detailStatus");
@@ -21,12 +28,29 @@ const briefDetails = document.getElementById("briefDetails");
 const briefBody = document.getElementById("briefBody");
 const memoryDetails = document.getElementById("memoryDetails");
 const memoryArtifactList = document.getElementById("memoryArtifactList");
+const overlayDetails = document.getElementById("overlayDetails");
+const overlayList = document.getElementById("overlayList");
+const overlayForm = document.getElementById("overlayForm");
+const overlayTypeInput = document.getElementById("overlayType");
+const overlayAuthorInput = document.getElementById("overlayAuthor");
+const overlayContentInput = document.getElementById("overlayContent");
+const overlayStatus = document.getElementById("overlayStatus");
+const refreshDerivedDetails = document.getElementById("refreshDerivedDetails");
+const refreshOpenLoopsBtn = document.getElementById("refreshOpenLoopsBtn");
+const refreshBriefsBtn = document.getElementById("refreshBriefsBtn");
+const refreshMemoryBtn = document.getElementById("refreshMemoryBtn");
+const refreshDerivedStatus = document.getElementById("refreshDerivedStatus");
 const artifactList = document.getElementById("artifactList");
 const artifactDetails = document.getElementById("artifactDetails");
 const searchForm = document.getElementById("searchForm");
 const searchInput = document.getElementById("searchInput");
 const searchResults = document.getElementById("searchResults");
 const searchStatus = document.getElementById("searchStatus");
+const browseScopeForm = document.getElementById("browseScopeForm");
+const scopeConversationIdInput = document.getElementById("scopeConversationId");
+const scopeImportIdInput = document.getElementById("scopeImportId");
+const scopeTruthfulOnlyInput = document.getElementById("scopeTruthfulOnly");
+const clearScopeBtn = document.getElementById("clearScopeBtn");
 let isApplyingUrlState = false;
 let selectedTimelineContext = null;
 
@@ -178,6 +202,23 @@ function formatMetaDateTime(iso) {
   return `${date.toLocaleString()} · ${iso}`;
 }
 
+function buildOverlayStalenessHtml(artifact) {
+  if (!artifact || artifact.overlay_stale !== true) {
+    return "";
+  }
+  const generatedAt = artifact.artifact_generated_at
+    ? formatMetaDateTime(artifact.artifact_generated_at)
+    : "unknown";
+  const overlayAt = artifact.latest_overlay_at ? formatMetaDateTime(artifact.latest_overlay_at) : "unknown";
+  return `
+    <div class="stale-badge" role="note" aria-label="Artifact may be stale after overlay">
+      May be stale after overlay
+    </div>
+    <div class="muted stale-meta">artifact generated: ${generatedAt}</div>
+    <div class="muted stale-meta">latest overlay: ${overlayAt}</div>
+  `;
+}
+
 function normalizeSpeakerLabel(label) {
   return String(label || "")
     .trim()
@@ -283,6 +324,7 @@ function renderDialogueBody(raw, turns) {
 
 function renderDetail(detail) {
   const raw = detail.raw_entry;
+  const overlays = Array.isArray(detail.overlays) ? detail.overlays : [];
   const artifacts = Array.isArray(detail.artifacts) ? detail.artifacts : [];
   const memoryArtifacts = artifacts.filter((artifact) =>
     ["memory", "compressed-memory"].includes(artifact.artifact_type)
@@ -311,7 +353,18 @@ function renderDetail(detail) {
   detailBody.setAttribute("aria-label", `Diary entry ${raw.entry_id}`);
 
   if (briefArtifacts.length) {
-    briefBody.textContent = briefArtifacts[0].content || "";
+    const currentBrief =
+      briefArtifacts.find((artifact) => artifact.is_current) || briefArtifacts[0];
+    briefBody.innerHTML = "";
+    const content = document.createElement("pre");
+    content.className = "artifact-body";
+    content.textContent = currentBrief.content || "";
+    briefBody.appendChild(content);
+    if (currentBrief.overlay_stale === true) {
+      const stale = document.createElement("div");
+      stale.innerHTML = buildOverlayStalenessHtml(currentBrief);
+      briefBody.appendChild(stale);
+    }
     briefDetails.open = true;
   } else {
     briefBody.textContent = "No conversation brief is attached to this entry yet.";
@@ -330,12 +383,29 @@ function renderDetail(detail) {
       <div><strong>${artifact.artifact_type || "compressed-memory"}</strong></div>
       <div class="muted">${formatMetaDateTime(artifact.created_at || "")}</div>
       <div class="muted">producer: ${artifact.producer || ""}</div>
+      ${buildOverlayStalenessHtml(artifact)}
       <pre class="artifact-body">${artifact.content || ""}</pre>
     `;
     memoryArtifactList.appendChild(li);
   }
   memoryDetails.hidden = true;
   memoryDetails.open = false;
+
+  overlayList.innerHTML = "";
+  if (!overlays.length) {
+    overlayList.innerHTML = '<li class="item muted">No overlays attached.</li>';
+  }
+  for (const overlay of overlays) {
+    const li = document.createElement("li");
+    li.className = "item";
+    li.innerHTML = `
+      <div><strong>${overlay.overlay_type || "overlay"}</strong></div>
+      <div class="muted">${formatMetaDateTime(overlay.created_at || "")} · author: ${overlay.author || ""}</div>
+      <pre class="artifact-body">${overlay.content || ""}</pre>
+    `;
+    overlayList.appendChild(li);
+  }
+  overlayDetails.open = overlays.length > 0;
 
   artifactList.innerHTML = "";
   if (!secondaryArtifacts.length) {
@@ -385,6 +455,7 @@ function renderDetail(detail) {
       <div class="muted">${formatMetaDateTime(artifact.created_at || "")}</div>
       <div class="muted">producer: ${artifact.producer || ""}</div>
       <div class="muted">id: ${artifact.artifact_id || ""}</div>
+      ${buildOverlayStalenessHtml(artifact)}
       ${openLoopHtml}
     `;
     for (const btn of li.querySelectorAll("button[data-support-entry-id]")) {
@@ -435,6 +506,49 @@ function renderSearchResults(matches) {
   wireListKeyboardNav(searchResults);
 }
 
+function renderImports(items) {
+  importsList.setAttribute("aria-busy", "false");
+  importsList.innerHTML = "";
+  if (!items.length) {
+    importsList.innerHTML = '<li class="item muted">No import batches found.</li>';
+    return;
+  }
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.className = "item";
+    const active = state.importId && state.importId === item.import_id;
+    const scopedConversation = item.source_conversation_id ? ` · ${item.source_conversation_id}` : "";
+    const scopedSession = item.source_session_id ? ` · ${item.source_session_id}` : "";
+    li.innerHTML = `
+      <button type="button" data-import-id="${item.import_id}" class="${active ? "active" : ""}" aria-current="${active ? "true" : "false"}">
+        <div><strong>${item.import_id}</strong></div>
+        <div class="muted">${formatMetaDateTime(item.imported_at || "")}${scopedConversation}${scopedSession}</div>
+        <div class="muted">imported ${item.imported_count || 0} · skipped duplicates ${item.skipped_duplicate_count || 0}</div>
+      </button>
+    `;
+    const btn = li.querySelector("button");
+    btn.addEventListener("click", async () => {
+      state.importId = String(item.import_id || "").trim();
+      if (item.source_conversation_id) {
+        state.sourceConversationId = String(item.source_conversation_id).trim();
+      }
+      state.truthfulOnly = true;
+      state.offset = 0;
+      scopeImportIdInput.value = state.importId;
+      scopeConversationIdInput.value = state.sourceConversationId;
+      scopeTruthfulOnlyInput.checked = state.truthfulOnly;
+      persistState();
+      writeUrlState();
+      await loadTimeline();
+      renderImports(items);
+      if (state.searchQuery) {
+        await runSearch(state.searchQuery);
+      }
+    });
+    importsList.appendChild(li);
+  }
+}
+
 function showError(listEl, message) {
   listEl.setAttribute("aria-busy", "false");
   listEl.innerHTML = `<li class="item error">${message}</li>`;
@@ -469,12 +583,39 @@ async function loadTimeline() {
   timelineStatus.textContent = "Loading entries...";
   timelineList.setAttribute("aria-busy", "true");
   try {
-    const result = await post("/list_entries", { limit: state.limit, offset: state.offset });
+    const filters = {};
+    if (state.sourceConversationId) filters.source_conversation_id = state.sourceConversationId;
+    if (state.sourceSessionId) filters.source_session_id = state.sourceSessionId;
+    if (state.importId) filters.import_id = state.importId;
+    if (state.truthfulOnly) filters.truthful_only = true;
+    const result = await post("/list_entries", {
+      limit: state.limit,
+      offset: state.offset,
+      filters,
+    });
     renderTimeline(result.items || []);
-    timelineStatus.textContent = `Showing ${result.items.length} entries · offset ${state.offset}`;
+    const scopeParts = [];
+    if (state.sourceConversationId) scopeParts.push(`conversation=${state.sourceConversationId}`);
+    if (state.importId) scopeParts.push(`import=${state.importId}`);
+    if (state.truthfulOnly) scopeParts.push("truthful-only");
+    const scopeLabel = scopeParts.length ? ` · scope ${scopeParts.join(", ")}` : "";
+    timelineStatus.textContent = `Showing ${result.items.length} entries · offset ${state.offset}${scopeLabel}`;
   } catch (err) {
     showError(timelineList, `Timeline error: ${err.message}`);
     timelineStatus.textContent = "Could not load entries.";
+  }
+}
+
+async function loadImports() {
+  importsStatus.textContent = "Loading import batches...";
+  importsList.setAttribute("aria-busy", "true");
+  try {
+    const result = await post("/list_imports", { limit: 20 });
+    renderImports(result.items || []);
+    importsStatus.textContent = `Showing ${result.count || 0} recent import batch(es). Click one to scope timeline/search.`;
+  } catch (err) {
+    showError(importsList, `Import batches error: ${err.message}`);
+    importsStatus.textContent = "Could not load import batches.";
   }
 }
 
@@ -501,11 +642,110 @@ async function loadEntry(entryId) {
   }
 }
 
+async function submitOverlay() {
+  if (!state.selectedEntryId) {
+    overlayStatus.textContent = "Select an entry first.";
+    return;
+  }
+  const overlayType = overlayTypeInput.value.trim();
+  const author = overlayAuthorInput.value.trim();
+  const content = overlayContentInput.value.trim();
+  if (!overlayType || !author || !content) {
+    overlayStatus.textContent = "Type, author, and content are required.";
+    return;
+  }
+  overlayStatus.textContent = "Saving overlay...";
+  try {
+    await post("/append_overlay", {
+      entry_id: state.selectedEntryId,
+      overlay_type: overlayType,
+      author,
+      content,
+    });
+    overlayContentInput.value = "";
+    overlayStatus.textContent = "Overlay added.";
+    await loadEntry(state.selectedEntryId);
+  } catch (err) {
+    overlayStatus.textContent = `Overlay save failed: ${err.message}`;
+  }
+}
+
+function producerPayloadFromCurrentContext() {
+  const payload = { limit: 200, force: true };
+  const hasScope = Boolean(state.sourceConversationId || state.sourceSessionId || state.importId || state.truthfulOnly);
+  if (hasScope) {
+    if (state.sourceConversationId) payload.source_conversation_id = state.sourceConversationId;
+    if (state.sourceSessionId) payload.source_session_id = state.sourceSessionId;
+    if (state.importId) payload.import_id = state.importId;
+    if (state.truthfulOnly) payload.truthful_only = true;
+    return payload;
+  }
+  if (state.selectedEntryId) {
+    payload.entry_ids = [state.selectedEntryId];
+  }
+  return payload;
+}
+
+function setRefreshDerivedButtonsDisabled(disabled) {
+  for (const btn of [refreshOpenLoopsBtn, refreshBriefsBtn, refreshMemoryBtn]) {
+    btn.disabled = disabled;
+  }
+}
+
+function summarizeProducerResult(endpoint, result) {
+  if (endpoint === "/produce_open_loops") {
+    return `Open loops refreshed. loops=${result.loop_count || 0} source_entries=${(result.source_entry_ids || []).length}`;
+  }
+  if (endpoint === "/produce_conversation_briefs") {
+    return `Conversation briefs refreshed. produced=${result.produced_count || 0} skipped=${result.skipped_count || 0}`;
+  }
+  if (endpoint === "/produce_compressed_memory") {
+    return `Compressed memory refreshed. produced=${result.produced_count || 0} skipped=${result.skipped_count || 0}`;
+  }
+  return "Derived layer refreshed.";
+}
+
+async function refreshDerived(endpoint) {
+  const payload = producerPayloadFromCurrentContext();
+  if (!payload.entry_ids && !payload.source_conversation_id && !payload.source_session_id && !payload.import_id && !payload.truthful_only) {
+    refreshDerivedStatus.textContent = "Select an entry or apply a scope first.";
+    return;
+  }
+  const label =
+    endpoint === "/produce_open_loops"
+      ? "open loops"
+      : endpoint === "/produce_conversation_briefs"
+        ? "conversation briefs"
+        : "compressed memory";
+  refreshDerivedStatus.textContent = `Refreshing ${label}...`;
+  setRefreshDerivedButtonsDisabled(true);
+  try {
+    const result = await post(endpoint, payload);
+    refreshDerivedStatus.textContent = summarizeProducerResult(endpoint, result);
+    await loadTimeline();
+    if (state.searchQuery) {
+      await runSearch(state.searchQuery);
+    }
+    if (state.selectedEntryId) {
+      await loadEntry(state.selectedEntryId);
+    }
+  } catch (err) {
+    refreshDerivedStatus.textContent = `Refresh failed: ${err.message}`;
+  } finally {
+    setRefreshDerivedButtonsDisabled(false);
+  }
+}
+
 async function runSearch(query) {
   searchStatus.textContent = "Searching memory layers...";
   searchResults.setAttribute("aria-busy", "true");
   try {
-    const result = await post("/search_memory", { query, limit: 20, filters: {} });
+    const filters = {};
+    if (state.sourceConversationId) filters.source_conversation_id = state.sourceConversationId;
+    if (state.sourceSessionId) filters.source_session_id = state.sourceSessionId;
+    if (state.importId) filters.import_id = state.importId;
+    if (state.truthfulOnly) filters.truthful_only = true;
+    const result = await post("/search_memory", { query, limit: 20, filters });
     state.searchQuery = query;
     persistState();
     writeUrlState();
@@ -529,6 +769,10 @@ function persistState() {
       apiBase: state.apiBase,
       limit: state.limit,
       offset: state.offset,
+      sourceConversationId: state.sourceConversationId,
+      sourceSessionId: state.sourceSessionId,
+      importId: state.importId,
+      truthfulOnly: state.truthfulOnly,
       selectedEntryId: state.selectedEntryId,
       searchQuery: state.searchQuery,
       selectedSearchHitEntryId: state.selectedSearchHitEntryId,
@@ -554,6 +798,21 @@ function writeUrlState() {
   } else {
     params.delete("offset");
   }
+  if (state.sourceConversationId) {
+    params.set("source_conversation_id", state.sourceConversationId);
+  } else {
+    params.delete("source_conversation_id");
+  }
+  if (state.importId) {
+    params.set("import_id", state.importId);
+  } else {
+    params.delete("import_id");
+  }
+  if (state.truthfulOnly) {
+    params.set("truthful_only", "1");
+  } else {
+    params.delete("truthful_only");
+  }
   const next = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}`;
   window.history.replaceState({}, "", next);
 }
@@ -563,6 +822,9 @@ function restoreStateFromUrl() {
   const entry = params.get("entry");
   const q = params.get("q");
   const offset = params.get("offset");
+  const sourceConversationId = params.get("source_conversation_id");
+  const importId = params.get("import_id");
+  const truthfulOnly = params.get("truthful_only");
   let found = false;
   if (entry) {
     state.selectedEntryId = entry;
@@ -579,6 +841,18 @@ function restoreStateFromUrl() {
       found = true;
     }
   }
+  if (sourceConversationId !== null) {
+    state.sourceConversationId = sourceConversationId.trim();
+    found = true;
+  }
+  if (importId !== null) {
+    state.importId = importId.trim();
+    found = true;
+  }
+  if (truthfulOnly !== null) {
+    state.truthfulOnly = truthfulOnly === "1" || truthfulOnly.toLowerCase() === "true";
+    found = true;
+  }
   return found;
 }
 
@@ -590,6 +864,10 @@ function restoreState() {
     state.apiBase = parsed.apiBase || state.apiBase;
     state.limit = Number.isInteger(parsed.limit) ? parsed.limit : state.limit;
     state.offset = Number.isInteger(parsed.offset) ? parsed.offset : state.offset;
+    state.sourceConversationId = parsed.sourceConversationId || "";
+    state.sourceSessionId = parsed.sourceSessionId || "";
+    state.importId = parsed.importId || "";
+    state.truthfulOnly = Boolean(parsed.truthfulOnly);
     state.selectedEntryId = parsed.selectedEntryId || null;
     state.searchQuery = parsed.searchQuery || "";
     state.selectedSearchHitEntryId = parsed.selectedSearchHitEntryId || null;
@@ -604,6 +882,7 @@ reloadBtn.addEventListener("click", async () => {
   persistState();
   writeUrlState();
   await loadTimeline();
+  await loadImports();
 });
 
 prevPageBtn.addEventListener("click", async () => {
@@ -620,11 +899,58 @@ nextPageBtn.addEventListener("click", async () => {
   await loadTimeline();
 });
 
+refreshImportsBtn.addEventListener("click", async () => {
+  await loadImports();
+});
+
 searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const query = searchInput.value.trim();
   if (!query) return;
   await runSearch(query);
+});
+
+overlayForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await submitOverlay();
+});
+
+refreshOpenLoopsBtn.addEventListener("click", async () => {
+  await refreshDerived("/produce_open_loops");
+});
+
+refreshBriefsBtn.addEventListener("click", async () => {
+  await refreshDerived("/produce_conversation_briefs");
+});
+
+refreshMemoryBtn.addEventListener("click", async () => {
+  await refreshDerived("/produce_compressed_memory");
+});
+
+browseScopeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  state.sourceConversationId = scopeConversationIdInput.value.trim();
+  state.importId = scopeImportIdInput.value.trim();
+  state.truthfulOnly = Boolean(scopeTruthfulOnlyInput.checked);
+  state.offset = 0;
+  persistState();
+  writeUrlState();
+  await loadTimeline();
+  await loadImports();
+});
+
+clearScopeBtn.addEventListener("click", async () => {
+  scopeConversationIdInput.value = "";
+  scopeImportIdInput.value = "";
+  scopeTruthfulOnlyInput.checked = false;
+  state.sourceConversationId = "";
+  state.importId = "";
+  state.truthfulOnly = false;
+  state.offset = 0;
+  persistState();
+  writeUrlState();
+  await loadTimeline();
+  await loadImports();
 });
 
 async function init() {
@@ -634,6 +960,9 @@ async function init() {
   }
   apiBaseInput.value = state.apiBase;
   searchInput.value = state.searchQuery;
+  scopeConversationIdInput.value = state.sourceConversationId;
+  scopeImportIdInput.value = state.importId;
+  scopeTruthfulOnlyInput.checked = state.truthfulOnly;
   state.apiBase = apiBaseInput.value.trim().replace(/\/$/, "");
   await loadTimeline();
   if (state.searchQuery) {
@@ -646,8 +975,12 @@ async function init() {
   } else {
     detailStatus.textContent = "Select an entry from timeline or search.";
     artifactDetails.open = false;
+    overlayDetails.open = false;
+    refreshDerivedDetails.open = false;
     memoryDetails.hidden = true;
     memoryDetails.open = false;
+    overlayStatus.textContent = "";
+    refreshDerivedStatus.textContent = "";
     clearDetailBody();
     detailBody.textContent = "Select an entry to view raw detail.";
   }
@@ -660,17 +993,29 @@ window.addEventListener("popstate", async () => {
     selectedEntryId: state.selectedEntryId,
     searchQuery: state.searchQuery,
     offset: state.offset,
+    sourceConversationId: state.sourceConversationId,
+    importId: state.importId,
+    truthfulOnly: state.truthfulOnly,
   };
   state.selectedEntryId = null;
   state.searchQuery = "";
   state.offset = 0;
+  state.sourceConversationId = "";
+  state.importId = "";
+  state.truthfulOnly = false;
   const hasUrlState = restoreStateFromUrl();
   if (!hasUrlState) {
     state.selectedEntryId = snapshot.selectedEntryId;
     state.searchQuery = snapshot.searchQuery;
     state.offset = snapshot.offset;
+    state.sourceConversationId = snapshot.sourceConversationId;
+    state.importId = snapshot.importId;
+    state.truthfulOnly = snapshot.truthfulOnly;
   }
   searchInput.value = state.searchQuery;
+  scopeConversationIdInput.value = state.sourceConversationId;
+  scopeImportIdInput.value = state.importId;
+  scopeTruthfulOnlyInput.checked = state.truthfulOnly;
   await loadTimeline();
   if (state.searchQuery) {
     await runSearch(state.searchQuery);
@@ -687,6 +1032,10 @@ window.addEventListener("popstate", async () => {
     detailStatus.textContent = "Select an entry from timeline or search.";
     memoryDetails.hidden = true;
     memoryDetails.open = false;
+    overlayStatus.textContent = "";
+    refreshDerivedStatus.textContent = "";
+    overlayList.innerHTML = "";
+    overlayDetails.open = false;
     memoryArtifactList.innerHTML = "";
     artifactList.innerHTML = "";
   }

@@ -3,14 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from agent_diary.cli.session_builder import build_session_jsonl
-from agent_diary.cli.openclaw_session_import import backfill_openclaw_session_key, import_openclaw_session
+from agent_diary.cli.openclaw_session_import import (
+    backfill_openclaw_session_key,
+    backfill_telegram_direct,
+    import_openclaw_session,
+    import_telegram_direct,
+)
 from agent_diary.cli.transcript_adapter import SUPPORTED_ADAPTER_FORMATS, adapt_session_export, build_openclaw_telegram_direct_transcript
 from agent_diary.config import default_paths
 from agent_diary.index.sqlite_index import bootstrap_sqlite
 from agent_diary.service.handlers import (
     append_entry,
+    append_overlay,
     attach_artifact,
     fetch_entry_detail,
     fetch_raw_entry,
@@ -21,6 +28,7 @@ from agent_diary.service.handlers import (
     produce_conversation_briefs,
     produce_compressed_memory,
     produce_open_loops,
+    normalize_derived_artifact_lifecycle,
     refresh_derived_for_import,
     search_memory,
 )
@@ -61,10 +69,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_artifact.add_argument("--created-at")
     p_artifact.add_argument("--metadata", default="{}")
 
+    p_overlay = sub.add_parser("append-overlay")
+    p_overlay.add_argument("--entry-id", required=True)
+    p_overlay.add_argument("--overlay-type", required=True)
+    p_overlay.add_argument("--author", required=True)
+    p_overlay.add_argument("--content", required=True)
+    p_overlay.add_argument("--created-at")
+    p_overlay.add_argument("--metadata", default="{}")
+
     p_search = sub.add_parser("search-memory")
     p_search.add_argument("--query", required=True)
     p_search.add_argument("--limit", type=int, default=20)
     p_search.add_argument("--filters", default="{}")
+    p_search.add_argument("--source-conversation-id", help="optional provenance filter")
+    p_search.add_argument("--source-session-id", help="optional provenance filter")
+    p_search.add_argument("--import-id", help="optional provenance filter")
+    p_search.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
 
     p_fetch = sub.add_parser("fetch-raw-entry")
     p_fetch.add_argument("--entry-id", required=True)
@@ -74,6 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list-entries")
     p_list.add_argument("--limit", type=int, default=20)
     p_list.add_argument("--offset", type=int, default=0)
+    p_list.add_argument("--source-conversation-id", help="optional provenance filter")
+    p_list.add_argument("--source-session-id", help="optional provenance filter")
+    p_list.add_argument("--import-id", help="optional provenance filter")
+    p_list.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
+    p_list.add_argument("--filters", default="{}", help="optional JSON object merged with explicit provenance filters")
 
     p_detail = sub.add_parser("fetch-entry-detail")
     p_detail.add_argument("--entry-id", required=True)
@@ -81,16 +106,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_open_loops = sub.add_parser("produce-open-loops")
     p_open_loops.add_argument("--limit", type=int, default=20)
     p_open_loops.add_argument("--entry-ids", nargs="*", default=None)
+    p_open_loops.add_argument("--source-conversation-id", help="optional provenance filter")
+    p_open_loops.add_argument("--source-session-id", help="optional provenance filter")
+    p_open_loops.add_argument("--import-id", help="optional provenance filter")
+    p_open_loops.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
+    p_open_loops.add_argument("--filters", default="{}", help="optional JSON object merged with explicit provenance filters")
 
     p_briefs = sub.add_parser("produce-conversation-briefs")
     p_briefs.add_argument("--limit", type=int, default=20)
     p_briefs.add_argument("--entry-ids", nargs="*", default=None)
     p_briefs.add_argument("--force", action="store_true")
+    p_briefs.add_argument("--source-conversation-id", help="optional provenance filter")
+    p_briefs.add_argument("--source-session-id", help="optional provenance filter")
+    p_briefs.add_argument("--import-id", help="optional provenance filter")
+    p_briefs.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
+    p_briefs.add_argument("--filters", default="{}", help="optional JSON object merged with explicit provenance filters")
 
     p_memory = sub.add_parser("produce-compressed-memory")
     p_memory.add_argument("--limit", type=int, default=20)
     p_memory.add_argument("--entry-ids", nargs="*", default=None)
     p_memory.add_argument("--force", action="store_true")
+    p_memory.add_argument("--source-conversation-id", help="optional provenance filter")
+    p_memory.add_argument("--source-session-id", help="optional provenance filter")
+    p_memory.add_argument("--import-id", help="optional provenance filter")
+    p_memory.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
+    p_memory.add_argument("--filters", default="{}", help="optional JSON object merged with explicit provenance filters")
 
     p_import = sub.add_parser("import-entries-jsonl")
     p_import.add_argument("--path", required=True)
@@ -126,6 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_refresh_import.add_argument("--dry-run", action="store_true", help="show what would refresh without writing new artifacts")
     p_refresh_import.add_argument("--no-force", action="store_true", help="do not force brief/memory regeneration when artifacts already exist")
 
+    p_normalize_lifecycle = sub.add_parser(
+        "normalize-derived-artifact-lifecycle",
+        help="normalize lifecycle metadata for existing derived artifacts",
+        description="Mark exactly one active artifact per logical scope and mark older siblings as superseded without deleting history.",
+    )
+    p_normalize_lifecycle.add_argument("--dry-run", action="store_true", help="report lifecycle fixes without writing artifact files")
+    p_normalize_lifecycle.add_argument("--entry-id", help="optional entry id filter")
+    p_normalize_lifecycle.add_argument("--artifact-type", help="optional artifact type filter")
+
     p_openclaw_import = sub.add_parser(
         "import-openclaw-session",
         help="one-step truthful import for OpenClaw session exports",
@@ -144,6 +193,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_openclaw_import.add_argument("--min-messages-before-gap-split", type=int, default=4, help="avoid splitting on a time gap when the current chunk is still smaller than this many messages")
     p_openclaw_import.add_argument("--min-chars-before-gap-split", type=int, default=400, help="avoid splitting on a time gap when the current chunk is still smaller than this many rendered characters")
 
+    p_telegram_direct_import = sub.add_parser(
+        "import-telegram-direct",
+        help="one-step truthful import for Telegram direct chat transcripts",
+        description="Build canonical Telegram-direct transcript from inbound Telegram logs plus OpenClaw session message.send events, then chunk and import through the truthful recurring-ingestion path.",
+    )
+    p_telegram_direct_import.add_argument("--inbound-path", required=True, help="path to Telegram inbound log JSONL")
+    p_telegram_direct_import.add_argument("--sessions-root", required=True, help="directory containing OpenClaw session *.jsonl files")
+    p_telegram_direct_import.add_argument("--chat-id", required=True, help="Telegram chat id to import")
+    p_telegram_direct_import.add_argument("--source", default="telegram-direct-import", help="source label stored on imported raw entries")
+    p_telegram_direct_import.add_argument("--source-session-id", help="override or supply the source session id")
+    p_telegram_direct_import.add_argument("--source-conversation-id", help="override or supply the source conversation id")
+    p_telegram_direct_import.add_argument("--import-id", help="override the generated import batch id")
+    p_telegram_direct_import.add_argument("--dry-run", action="store_true", help="show what would import without writing raw entries")
+    p_telegram_direct_import.add_argument("--gap-minutes", type=int, default=60, help="group transcript messages into a chunk when gaps exceed this many minutes")
+    p_telegram_direct_import.add_argument("--max-chars", type=int, default=6000, help="split session chunks when rendered text exceeds this many characters")
+    p_telegram_direct_import.add_argument("--max-messages", type=int, default=80, help="split session chunks when they exceed this many messages")
+    p_telegram_direct_import.add_argument("--min-messages-before-gap-split", type=int, default=4, help="avoid splitting on a time gap when the current chunk is still smaller than this many messages")
+    p_telegram_direct_import.add_argument("--min-chars-before-gap-split", type=int, default=400, help="avoid splitting on a time gap when the current chunk is still smaller than this many rendered characters")
+
     p_backfill = sub.add_parser(
         "backfill-openclaw-session-key",
         help="import many OpenClaw session files discovered from trajectory metadata for one session key",
@@ -161,6 +229,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_backfill.add_argument("--max-messages", type=int, default=80, help="split session chunks when they exceed this many messages")
     p_backfill.add_argument("--min-messages-before-gap-split", type=int, default=4, help="avoid splitting on a time gap when the current chunk is still smaller than this many messages")
     p_backfill.add_argument("--min-chars-before-gap-split", type=int, default=400, help="avoid splitting on a time gap when the current chunk is still smaller than this many rendered characters")
+
+    p_backfill_telegram = sub.add_parser(
+        "backfill-telegram-direct",
+        help="truth-first backfill for one Telegram direct chat using trajectory-scoped session discovery",
+        description="Discover OpenClaw session files from trajectory metadata for one session key and backfill that window through Telegram-direct reconstruction (inbound Telegram log + outbound message.send events).",
+    )
+    p_backfill_telegram.add_argument("--inbound-path", required=True, help="path to Telegram inbound log JSONL")
+    p_backfill_telegram.add_argument("--sessions-root", required=True, help="directory containing OpenClaw session *.jsonl files")
+    p_backfill_telegram.add_argument("--trajectories-root", default="~/.openclaw/agents/main/sessions", help="directory containing *.trajectory.jsonl files")
+    p_backfill_telegram.add_argument("--session-key", required=True, help="OpenClaw session key used for trajectory-scoped discovery")
+    p_backfill_telegram.add_argument("--chat-id", required=True, help="Telegram chat id to backfill")
+    p_backfill_telegram.add_argument("--source", default="telegram-direct-backfill", help="source label stored on imported raw entries")
+    p_backfill_telegram.add_argument("--since", help="inclusive lower bound for trajectory/message time; accepts YYYY-MM-DD or ISO timestamp")
+    p_backfill_telegram.add_argument("--until", help="exclusive upper bound for trajectory/message time; accepts YYYY-MM-DD or ISO timestamp")
+    p_backfill_telegram.add_argument("--days-back", type=int, help="convenience window counting backward from now when --since is omitted")
+    p_backfill_telegram.add_argument("--dry-run", action="store_true", help="discover and plan backfill without writing raw entries")
+    p_backfill_telegram.add_argument("--gap-minutes", type=int, default=60, help="group transcript messages into a chunk when gaps exceed this many minutes")
+    p_backfill_telegram.add_argument("--max-chars", type=int, default=6000, help="split session chunks when rendered text exceeds this many characters")
+    p_backfill_telegram.add_argument("--max-messages", type=int, default=80, help="split session chunks when they exceed this many messages")
+    p_backfill_telegram.add_argument("--min-messages-before-gap-split", type=int, default=4, help="avoid splitting on a time gap when the current chunk is still smaller than this many messages")
+    p_backfill_telegram.add_argument("--min-chars-before-gap-split", type=int, default=400, help="avoid splitting on a time gap when the current chunk is still smaller than this many rendered characters")
 
     p_list_imports = sub.add_parser(
         "list-imports",
@@ -217,6 +306,20 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    def _merge_scope_filters(raw_filters: str, args_obj: argparse.Namespace) -> dict[str, Any]:
+        merged = json.loads(raw_filters)
+        if not isinstance(merged, dict):
+            raise ValueError("--filters must decode to a JSON object")
+        if getattr(args_obj, "source_conversation_id", None):
+            merged["source_conversation_id"] = args_obj.source_conversation_id
+        if getattr(args_obj, "source_session_id", None):
+            merged["source_session_id"] = args_obj.source_session_id
+        if getattr(args_obj, "import_id", None):
+            merged["import_id"] = args_obj.import_id
+        if bool(getattr(args_obj, "truthful_only", False)):
+            merged["truthful_only"] = True
+        return merged
+
     paths = default_paths()
     ensure_data_dirs(paths)
     bootstrap_sqlite(paths.sqlite_path)
@@ -250,11 +353,25 @@ def main() -> None:
         _print(out, args.json)
         return
 
+    if args.command == "append-overlay":
+        payload = {
+            "entry_id": args.entry_id,
+            "overlay_type": args.overlay_type,
+            "author": args.author,
+            "content": args.content,
+            "metadata": json.loads(args.metadata),
+        }
+        if args.created_at:
+            payload["created_at"] = args.created_at
+        out = append_overlay(paths, payload)
+        _print(out, args.json)
+        return
+
     if args.command == "search-memory":
         payload = {
             "query": args.query,
             "limit": args.limit,
-            "filters": json.loads(args.filters),
+            "filters": _merge_scope_filters(args.filters, args),
         }
         out = search_memory(paths, payload)
         _print(out, args.json)
@@ -271,7 +388,8 @@ def main() -> None:
         return
 
     if args.command == "list-entries":
-        out = list_entries(paths, {"limit": args.limit, "offset": args.offset})
+        merged_filters = _merge_scope_filters(args.filters, args)
+        out = list_entries(paths, {"limit": args.limit, "offset": args.offset, "filters": merged_filters})
         _print(out, args.json)
         return
 
@@ -281,22 +399,31 @@ def main() -> None:
         return
 
     if args.command == "produce-open-loops":
-        out = produce_open_loops(paths, {"limit": args.limit, "entry_ids": args.entry_ids})
+        out = produce_open_loops(
+            paths,
+            {
+                "limit": args.limit,
+                "entry_ids": args.entry_ids,
+                "filters": _merge_scope_filters(args.filters, args),
+            },
+        )
         _print(out, args.json)
         return
 
     if args.command == "produce-conversation-briefs":
+        merged_filters = _merge_scope_filters(args.filters, args)
         out = produce_conversation_briefs(
             paths,
-            {"limit": args.limit, "entry_ids": args.entry_ids, "force": args.force},
+            {"limit": args.limit, "entry_ids": args.entry_ids, "force": args.force, "filters": merged_filters},
         )
         _print(out, args.json)
         return
 
     if args.command == "produce-compressed-memory":
+        merged_filters = _merge_scope_filters(args.filters, args)
         out = produce_compressed_memory(
             paths,
-            {"limit": args.limit, "entry_ids": args.entry_ids, "force": args.force},
+            {"limit": args.limit, "entry_ids": args.entry_ids, "force": args.force, "filters": merged_filters},
         )
         _print(out, args.json)
         return
@@ -364,6 +491,18 @@ def main() -> None:
         _print(out, args.json)
         return
 
+    if args.command == "normalize-derived-artifact-lifecycle":
+        out = normalize_derived_artifact_lifecycle(
+            paths,
+            {
+                "dry_run": args.dry_run,
+                "entry_id": args.entry_id,
+                "artifact_type": args.artifact_type,
+            },
+        )
+        _print(out, args.json)
+        return
+
     if args.command == "build-session-jsonl":
         out = build_session_jsonl(
             input_path=Path(args.input_path).expanduser().resolve(),
@@ -420,11 +559,53 @@ def main() -> None:
         _print(out, args.json)
         return
 
+    if args.command == "import-telegram-direct":
+        out = import_telegram_direct(
+            paths,
+            inbound_path=Path(args.inbound_path).expanduser().resolve(),
+            sessions_root=Path(args.sessions_root).expanduser().resolve(),
+            chat_id=str(args.chat_id),
+            source=args.source,
+            import_id=args.import_id,
+            source_session_id=args.source_session_id,
+            source_conversation_id=args.source_conversation_id,
+            dry_run=args.dry_run,
+            gap_minutes=args.gap_minutes,
+            max_chars=args.max_chars,
+            max_messages=args.max_messages,
+            min_messages_before_gap_split=args.min_messages_before_gap_split,
+            min_chars_before_gap_split=args.min_chars_before_gap_split,
+        )
+        _print(out, args.json)
+        return
+
     if args.command == "backfill-openclaw-session-key":
         out = backfill_openclaw_session_key(
             paths,
             trajectories_root=Path(args.trajectories_root).expanduser().resolve(),
             session_key=args.session_key,
+            source=args.source,
+            since=args.since,
+            until=args.until,
+            days_back=args.days_back,
+            dry_run=args.dry_run,
+            gap_minutes=args.gap_minutes,
+            max_chars=args.max_chars,
+            max_messages=args.max_messages,
+            min_messages_before_gap_split=args.min_messages_before_gap_split,
+            min_chars_before_gap_split=args.min_chars_before_gap_split,
+        )
+        _print(out, args.json)
+        return
+
+    if args.command == "backfill-telegram-direct":
+        out = backfill_telegram_direct(
+            paths,
+            inbound_path=Path(args.inbound_path).expanduser().resolve(),
+            sessions_root=Path(args.sessions_root).expanduser().resolve(),
+            trajectories_root=Path(args.trajectories_root).expanduser().resolve(),
+            session_key=str(args.session_key),
+            chat_id=str(args.chat_id),
             source=args.source,
             since=args.since,
             until=args.until,

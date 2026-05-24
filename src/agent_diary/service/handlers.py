@@ -28,9 +28,9 @@ from agent_diary.index.repository import (
     list_entry_rows,
     search_memory as search_index,
 )
-from agent_diary.models.types import Artifact, RawEntry
+from agent_diary.models.types import Artifact, Overlay, RawEntry
 from agent_diary.storage.entry_reader import fetch_raw_entry as fetch_entry_from_files
-from agent_diary.storage.files import append_artifact, append_raw_entry
+from agent_diary.storage.files import append_artifact, append_overlay as append_overlay_file, append_raw_entry
 from agent_diary.storage.imports import (
     build_source_item_key,
     load_import_batch_manifest,
@@ -56,6 +56,24 @@ def append_entry(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     raw_path = append_raw_entry(paths, entry)
     insert_entry(paths.sqlite_path, entry, str(raw_path))
     return {"entry_id": entry.entry_id, "raw_file": str(raw_path)}
+
+
+def append_overlay(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    _require_fields(payload, ["entry_id", "overlay_type", "author", "content"])
+    entry_id = str(payload["entry_id"]).strip()
+    if not entry_id:
+        raise ValueError("entry_id is required")
+    if get_entry_row(paths.sqlite_path, entry_id) is None:
+        raise FileNotFoundError(f"entry not found: {entry_id}")
+
+    overlay = Overlay(**payload)
+    overlay_path = append_overlay_file(paths, overlay)
+    return {
+        "entry_id": overlay.entry_id,
+        "overlay_id": overlay.overlay_id,
+        "overlay_file": str(overlay_path),
+        "overlay_type": overlay.overlay_type,
+    }
 
 
 def _utc_now_iso() -> str:
@@ -365,6 +383,268 @@ def _build_preview(text: str, size: int = 140) -> str:
     return compact[: size - 3] + "..."
 
 
+def _normalize_optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _resolve_provenance_filters(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_filters = payload.get("filters")
+    filters = raw_filters if isinstance(raw_filters, dict) else {}
+    return {
+        "source_conversation_id": _normalize_optional_str(
+            filters.get("source_conversation_id", payload.get("source_conversation_id"))
+        ),
+        "source_session_id": _normalize_optional_str(
+            filters.get("source_session_id", payload.get("source_session_id"))
+        ),
+        "import_id": _normalize_optional_str(filters.get("import_id", payload.get("import_id"))),
+        "truthful_only": bool(filters.get("truthful_only", payload.get("truthful_only", False))),
+    }
+
+
+def _resolve_producer_entry_ids(
+    paths: Paths,
+    *,
+    payload: dict[str, Any],
+    limit: int,
+) -> tuple[list[str] | None, dict[str, Any]]:
+    entry_ids = payload.get("entry_ids")
+    if entry_ids:
+        if not isinstance(entry_ids, list):
+            raise ValueError("entry_ids must be a list when provided")
+        normalized = [str(e).strip() for e in entry_ids if str(e).strip()]
+        return normalized, {"selection_mode": "entry_ids", "filters": None}
+
+    filters = _resolve_provenance_filters(payload)
+    if not any([filters["source_conversation_id"], filters["source_session_id"], filters["import_id"], filters["truthful_only"]]):
+        return None, {"selection_mode": "unscoped", "filters": filters}
+
+    scoped = list_entries(
+        paths,
+        {
+            "limit": limit,
+            "offset": 0,
+            "filters": {
+                key: value
+                for key, value in {
+                    "source_conversation_id": filters["source_conversation_id"],
+                    "source_session_id": filters["source_session_id"],
+                    "import_id": filters["import_id"],
+                    "truthful_only": filters["truthful_only"],
+                }.items()
+                if value
+            },
+        },
+    )
+    scoped_entry_ids = [str(item.get("entry_id", "")).strip() for item in scoped.get("items", []) if str(item.get("entry_id", "")).strip()]
+    return scoped_entry_ids, {"selection_mode": "provenance_scope", "filters": filters}
+
+
+def _canonical_source_entry_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return sorted({str(entry_id).strip() for entry_id in value if str(entry_id).strip()})
+
+
+def _artifact_scope(artifact_body: dict[str, Any]) -> dict[str, Any]:
+    artifact_type = str(artifact_body.get("artifact_type", "")).strip()
+    metadata = artifact_body.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if artifact_type == "analysis:open-loop":
+        source_entry_ids = _canonical_source_entry_ids(metadata.get("source_entry_ids"))
+        if not source_entry_ids:
+            anchor_id = str(artifact_body.get("entry_id", "")).strip()
+            if anchor_id:
+                source_entry_ids = [anchor_id]
+        return {
+            "artifact_type": artifact_type,
+            "scope_type": "lineage_source_entry_ids",
+            "source_entry_ids": source_entry_ids,
+        }
+    source_entry_id = str(metadata.get("source_entry_id", "")).strip()
+    if source_entry_id:
+        return {
+            "artifact_type": artifact_type,
+            "scope_type": "source_entry_id",
+            "source_entry_id": source_entry_id,
+        }
+    return {
+        "artifact_type": artifact_type,
+        "scope_type": "entry_id",
+        "entry_id": str(artifact_body.get("entry_id", "")).strip(),
+    }
+
+
+def _artifact_generation_key(artifact_body: dict[str, Any]) -> str:
+    return json.dumps(_artifact_scope(artifact_body), sort_keys=True, separators=(",", ":"))
+
+
+def _artifact_lifecycle_status(artifact_body: dict[str, Any]) -> str:
+    metadata = artifact_body.get("metadata")
+    if not isinstance(metadata, dict):
+        return "active"
+    status = str(metadata.get("lifecycle_status", "")).strip().lower()
+    if status in {"active", "superseded"}:
+        return status
+    return "active"
+
+
+def _is_artifact_active(artifact_body: dict[str, Any]) -> bool:
+    return _artifact_lifecycle_status(artifact_body) == "active"
+
+
+def _write_artifact_json(path: Path, body: dict[str, Any]) -> None:
+    path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+
+
+def _candidate_artifact_paths(paths: Paths, artifact_body: dict[str, Any]) -> list[Path]:
+    scope = _artifact_scope(artifact_body)
+    if scope.get("scope_type") == "lineage_source_entry_ids":
+        return list(paths.artifacts_dir.glob("*/artifact_*.json"))
+    entry_id = str(artifact_body.get("entry_id", "")).strip()
+    if not entry_id:
+        return []
+    artifact_dir = paths.artifacts_dir / entry_id
+    if not artifact_dir.exists():
+        return []
+    return list(artifact_dir.glob("artifact_*.json"))
+
+
+def _mark_prior_artifacts_superseded(paths: Paths, new_artifact_body: dict[str, Any]) -> None:
+    new_scope = _artifact_scope(new_artifact_body)
+    new_artifact_id = str(new_artifact_body.get("artifact_id", "")).strip()
+    superseded_at = str(new_artifact_body.get("created_at", "")).strip()
+    for artifact_path in _candidate_artifact_paths(paths, new_artifact_body):
+        try:
+            existing = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(existing.get("artifact_id", "")).strip() == new_artifact_id:
+            continue
+        if _artifact_scope(existing) != new_scope:
+            continue
+        if not _is_artifact_active(existing):
+            continue
+        metadata = existing.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata["lifecycle_status"] = "superseded"
+        metadata["superseded_at"] = superseded_at
+        metadata["superseded_by_artifact_id"] = new_artifact_id
+        metadata.setdefault("generation_key", _artifact_generation_key(existing))
+        existing["metadata"] = metadata
+        _write_artifact_json(artifact_path, existing)
+
+
+def normalize_derived_artifact_lifecycle(paths: Paths, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    dry_run = bool(payload.get("dry_run", False))
+    entry_id_filter = str(payload.get("entry_id", "")).strip() or None
+    artifact_type_filter = str(payload.get("artifact_type", "")).strip() or None
+
+    all_records: list[dict[str, Any]] = []
+    for artifact_path in paths.artifacts_dir.glob("*/artifact_*.json"):
+        try:
+            artifact_body = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        artifact_type = str(artifact_body.get("artifact_type", "")).strip()
+        artifact_id = str(artifact_body.get("artifact_id", "")).strip()
+        created_at = str(artifact_body.get("created_at", "")).strip()
+        if not artifact_type or not artifact_id:
+            continue
+        all_records.append(
+            {
+                "path": artifact_path,
+                "body": artifact_body,
+                "scope_key": _artifact_generation_key(artifact_body),
+                "sort_key": (created_at, artifact_id),
+                "artifact_id": artifact_id,
+            }
+        )
+
+    by_scope: dict[str, list[dict[str, Any]]] = {}
+    for record in all_records:
+        by_scope.setdefault(str(record["scope_key"]), []).append(record)
+
+    def _record_matches_filter(record: dict[str, Any]) -> bool:
+        body = record["body"]
+        if entry_id_filter and str(body.get("entry_id", "")).strip() != entry_id_filter:
+            return False
+        if artifact_type_filter and str(body.get("artifact_type", "")).strip() != artifact_type_filter:
+            return False
+        return True
+
+    touched_scopes = {
+        scope_key for scope_key, records in by_scope.items() if any(_record_matches_filter(record) for record in records)
+    }
+
+    changes: list[dict[str, Any]] = []
+    normalized_scope_count = 0
+    for scope_key in sorted(touched_scopes):
+        records = by_scope.get(scope_key, [])
+        if not records:
+            continue
+        normalized_scope_count += 1
+        sorted_records = sorted(records, key=lambda record: record["sort_key"], reverse=True)
+        active = sorted_records[0]
+        active_artifact_id = str(active["artifact_id"])
+        active_created_at = str(active["sort_key"][0])
+        for record in sorted_records:
+            body = record["body"]
+            metadata = body.get("metadata")
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            desired_metadata = dict(metadata)
+            desired_metadata["generation_key"] = str(scope_key)
+            if str(record["artifact_id"]) == active_artifact_id:
+                desired_metadata["lifecycle_status"] = "active"
+                desired_metadata.pop("superseded_at", None)
+                desired_metadata.pop("superseded_by_artifact_id", None)
+            else:
+                desired_metadata["lifecycle_status"] = "superseded"
+                desired_metadata["superseded_at"] = active_created_at
+                desired_metadata["superseded_by_artifact_id"] = active_artifact_id
+            if desired_metadata == metadata:
+                continue
+            changes.append(
+                {
+                    "artifact_id": str(record["artifact_id"]),
+                    "artifact_file": str(record["path"]),
+                    "scope_key": str(scope_key),
+                    "from": {
+                        "lifecycle_status": metadata.get("lifecycle_status"),
+                        "superseded_at": metadata.get("superseded_at"),
+                        "superseded_by_artifact_id": metadata.get("superseded_by_artifact_id"),
+                        "generation_key": metadata.get("generation_key"),
+                    },
+                    "to": {
+                        "lifecycle_status": desired_metadata.get("lifecycle_status"),
+                        "superseded_at": desired_metadata.get("superseded_at"),
+                        "superseded_by_artifact_id": desired_metadata.get("superseded_by_artifact_id"),
+                        "generation_key": desired_metadata.get("generation_key"),
+                    },
+                }
+            )
+            if dry_run:
+                continue
+            body["metadata"] = desired_metadata
+            _write_artifact_json(record["path"], body)
+
+    return {
+        "dry_run": dry_run,
+        "filters": {
+            "entry_id": entry_id_filter,
+            "artifact_type": artifact_type_filter,
+        },
+        "scanned_artifact_count": len(all_records),
+        "normalized_scope_count": normalized_scope_count,
+        "changed_artifact_count": len(changes),
+        "changes": changes,
+    }
+
+
 def _build_open_loop_participation(paths: Paths) -> dict[str, dict[str, Any]]:
     participation: dict[str, dict[str, Any]] = {}
     for artifact_file in paths.artifacts_dir.glob("*/artifact_*.json"):
@@ -373,6 +653,8 @@ def _build_open_loop_participation(paths: Paths) -> dict[str, dict[str, Any]]:
         except (OSError, json.JSONDecodeError):
             continue
         if str(artifact.get("artifact_type", "")).strip() != "analysis:open-loop":
+            continue
+        if not _is_artifact_active(artifact):
             continue
         metadata = artifact.get("metadata")
         source_entry_ids: list[str] = []
@@ -422,10 +704,7 @@ def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, 
     candidates = list_entry_rows(paths.sqlite_path, limit=max(limit * 10, 200), offset=0)
     scored: list[dict[str, Any]] = []
     for row in candidates:
-        raw_file = Path(str(row["raw_file_path"]))
-        if not raw_file.exists():
-            continue
-        body = json.loads(raw_file.read_text(encoding="utf-8"))
+        body = _effective_entry_body_from_row(paths, row)
         content = str(body.get("content", ""))
         lowered = content.lower()
         if not any(term in lowered for term in terms):
@@ -451,6 +730,121 @@ def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, 
     return [{k: v for k, v in item.items() if k != "_score"} for item in scored[:limit]]
 
 
+def _format_overlay_for_effective_content(overlay: dict[str, Any]) -> str:
+    overlay_type = str(overlay.get("overlay_type", "")).strip() or "overlay"
+    author = str(overlay.get("author", "")).strip() or "unknown"
+    created_at = str(overlay.get("created_at", "")).strip() or "unknown-time"
+    content = str(overlay.get("content", "")).strip()
+    return f"- [{overlay_type}] by {author} at {created_at}: {content}"
+
+
+def _compose_effective_content(raw_content: str, overlays: list[dict[str, Any]]) -> str:
+    if not overlays:
+        return raw_content
+    overlay_lines = [_format_overlay_for_effective_content(o) for o in overlays if str(o.get("content", "")).strip()]
+    if not overlay_lines:
+        return raw_content
+    return (
+        f"{raw_content}\n\n"
+        "Overlay layer (annotations/corrections; raw entry remains unchanged):\n"
+        + "\n".join(overlay_lines)
+    )
+
+
+def _effective_entry_body_from_row(paths: Paths, row: dict[str, Any]) -> dict[str, Any]:
+    raw_file = Path(str(row["raw_file_path"]))
+    if not raw_file.exists():
+        return {"content": ""}
+    raw_body = json.loads(raw_file.read_text(encoding="utf-8"))
+    entry_id = str(raw_body.get("entry_id") or row.get("entry_id") or "").strip()
+    overlay_dir = paths.overlays_dir / entry_id if entry_id else None
+    overlay_files = sorted(overlay_dir.glob("*.json")) if overlay_dir and overlay_dir.exists() else []
+    overlays = [json.loads(path.read_text(encoding="utf-8")) for path in overlay_files]
+    effective = dict(raw_body)
+    effective["content"] = _compose_effective_content(str(raw_body.get("content", "")), overlays)
+    effective["_overlay_count"] = len(overlays)
+    return effective
+
+
+def _parse_iso_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _artifact_generated_at(artifact: dict[str, Any]) -> str | None:
+    metadata = artifact.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    generated_at = str(metadata.get("generated_at", "")).strip()
+    if generated_at:
+        return generated_at
+    created_at = str(artifact.get("created_at", "")).strip()
+    return created_at or None
+
+
+def _overlay_staleness_for_artifact(
+    artifact: dict[str, Any],
+    latest_overlay_at: str | None,
+    latest_overlay_dt: datetime | None,
+) -> dict[str, Any]:
+    artifact_generated_at = _artifact_generated_at(artifact)
+    artifact_generated_dt = _parse_iso_timestamp(artifact_generated_at)
+    stale = bool(
+        latest_overlay_dt is not None
+        and artifact_generated_dt is not None
+        and latest_overlay_dt > artifact_generated_dt
+    )
+    result = {
+        "overlay_stale": stale,
+        "artifact_generated_at": artifact_generated_at,
+        "latest_overlay_at": latest_overlay_at,
+    }
+    if stale:
+        result["overlay_stale_reason"] = "overlay_added_after_artifact_generation"
+    return result
+
+
+def _resolve_entry_provenance_from_body(body: dict[str, Any]) -> dict[str, Any]:
+    metadata = body.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    ingestion = metadata.get("ingestion")
+    ingestion = ingestion if isinstance(ingestion, dict) else {}
+    return {
+        "source_session_id": (
+            str(ingestion.get("source_session_id", "")).strip()
+            or str(metadata.get("source_session_id", "")).strip()
+            or None
+        ),
+        "source_conversation_id": (
+            str(ingestion.get("source_conversation_id", "")).strip()
+            or str(metadata.get("source_conversation_id", "")).strip()
+            or None
+        ),
+        "import_id": str(ingestion.get("import_id", "")).strip() or None,
+        "truthful_source": bool(ingestion.get("truthful_source", False)),
+    }
+
+
+def _entry_matches_provenance_scope(provenance: dict[str, Any], filters: dict[str, Any]) -> bool:
+    source_conversation_id = filters.get("source_conversation_id")
+    source_session_id = filters.get("source_session_id")
+    import_id = filters.get("import_id")
+    truthful_only = bool(filters.get("truthful_only", False))
+    if source_conversation_id and provenance.get("source_conversation_id") != source_conversation_id:
+        return False
+    if source_session_id and provenance.get("source_session_id") != source_session_id:
+        return False
+    if import_id and provenance.get("import_id") != import_id:
+        return False
+    if truthful_only and not bool(provenance.get("truthful_source", False)):
+        return False
+    return True
+
+
 def attach_artifact(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     _require_fields(
         payload,
@@ -460,6 +854,10 @@ def attach_artifact(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         raise FileNotFoundError(f"entry not found: {payload['entry_id']}")
 
     artifact = Artifact(**payload)
+    artifact.metadata = dict(artifact.metadata) if isinstance(artifact.metadata, dict) else {}
+    artifact.metadata["lifecycle_status"] = "active"
+    artifact.metadata["generation_key"] = _artifact_generation_key(artifact.to_dict())
+    _mark_prior_artifacts_superseded(paths, artifact.to_dict())
     artifact_path = append_artifact(paths, artifact)
     insert_artifact(paths.sqlite_path, artifact)
     indexed = False
@@ -482,39 +880,73 @@ def attach_artifact(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
 def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query", "")).strip()
     limit = int(payload.get("limit", 20))
-    filters = payload.get("filters", {})
-    compressed_matches = search_index(paths.sqlite_path, query=query, limit=limit)
-    linked_matches = [
-        {
-            "entry_id": row["entry_id"],
-            "artifact_id": row["artifact_id"],
-            "indexed_at": row["indexed_at"],
-            "match_text": _build_snippet(str(row["match_text"]), query),
-            "match_layer": "compressed_memory",
-            "fetch_raw_entry": {"entry_id": row["entry_id"]},
-        }
-        for row in compressed_matches
-    ]
-    fallback_matches: list[dict[str, Any]] = []
-    if not linked_matches:
-        fallback_matches = [
+    filters = _resolve_provenance_filters(payload)
+
+    compressed_matches = search_index(paths.sqlite_path, query=query, limit=max(limit * 10, 200))
+    linked_matches: list[dict[str, Any]] = []
+    for row in compressed_matches:
+        entry_id = str(row["entry_id"])
+        entry_row = get_entry_row(paths.sqlite_path, entry_id)
+        if entry_row is None:
+            continue
+        raw_file = Path(str(entry_row["raw_file_path"]))
+        if not raw_file.exists():
+            continue
+        body = json.loads(raw_file.read_text(encoding="utf-8"))
+        provenance = _resolve_entry_provenance_from_body(body)
+        if not _entry_matches_provenance_scope(provenance, filters):
+            continue
+        linked_matches.append(
             {
                 "entry_id": row["entry_id"],
                 "artifact_id": row["artifact_id"],
                 "indexed_at": row["indexed_at"],
                 "match_text": _build_snippet(str(row["match_text"]), query),
-                "match_layer": row["match_layer"],
-                "entry_type": row["entry_type"],
-                "source": row["source"],
-                "author_role": row["author_role"],
+                "match_layer": "compressed_memory",
                 "fetch_raw_entry": {"entry_id": row["entry_id"]},
             }
-            for row in _search_raw_entries(paths, query=query, limit=limit)
-        ]
+        )
+        if len(linked_matches) >= limit:
+            break
+    fallback_matches: list[dict[str, Any]] = []
+    if not linked_matches:
+        raw_hits = _search_raw_entries(paths, query=query, limit=max(limit * 10, 200))
+        for row in raw_hits:
+            entry_id = str(row["entry_id"])
+            entry_row = get_entry_row(paths.sqlite_path, entry_id)
+            if entry_row is None:
+                continue
+            raw_file = Path(str(entry_row["raw_file_path"]))
+            if not raw_file.exists():
+                continue
+            body = json.loads(raw_file.read_text(encoding="utf-8"))
+            provenance = _resolve_entry_provenance_from_body(body)
+            if not _entry_matches_provenance_scope(provenance, filters):
+                continue
+            fallback_matches.append(
+                {
+                    "entry_id": row["entry_id"],
+                    "artifact_id": row["artifact_id"],
+                    "indexed_at": row["indexed_at"],
+                    "match_text": _build_snippet(str(row["match_text"]), query),
+                    "match_layer": row["match_layer"],
+                    "entry_type": row["entry_type"],
+                    "source": row["source"],
+                    "author_role": row["author_role"],
+                    "fetch_raw_entry": {"entry_id": row["entry_id"]},
+                }
+            )
+            if len(fallback_matches) >= limit:
+                break
     return {
         "query": query,
         "limit": limit,
-        "filters": filters,
+        "filters": {
+            "source_conversation_id": filters.get("source_conversation_id"),
+            "source_session_id": filters.get("source_session_id"),
+            "import_id": filters.get("import_id"),
+            "truthful_only": bool(filters.get("truthful_only", False)),
+        },
         "matches": linked_matches or fallback_matches,
         "match_summary": {
             "compressed_memory_hits": len(linked_matches),
@@ -541,6 +973,11 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     limit = int(payload.get("limit", 20))
     offset = int(payload.get("offset", 0))
     only_with_open_loops = bool(payload.get("only_with_open_loops", False))
+    filters = _resolve_provenance_filters(payload)
+    source_conversation_id = filters["source_conversation_id"]
+    source_session_id = filters["source_session_id"]
+    import_id = filters["import_id"]
+    truthful_only = bool(filters["truthful_only"])
     if limit < 1:
         raise ValueError("limit must be >= 1")
     if offset < 0:
@@ -549,24 +986,55 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     row_offset = offset
     rows: list[dict[str, Any]]
     open_loop_participation = _build_open_loop_participation(paths)
-    if only_with_open_loops:
-        # In filtered mode, limit/offset apply to the filtered result set, ordered by
-        # open-loop freshness (latest linked last_seen_at), then stable tiebreakers.
+    needs_provenance_filter = any([source_conversation_id, source_session_id, import_id, truthful_only])
+    if only_with_open_loops or needs_provenance_filter:
         all_rows = list_entry_rows(paths.sqlite_path, limit=1000000, offset=0)
-        participating_rows = []
+        filtered_rows: list[dict[str, Any]] = []
         for row in all_rows:
+            raw_file = Path(str(row["raw_file_path"]))
+            body = json.loads(raw_file.read_text(encoding="utf-8"))
+            metadata = body.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            ingestion = metadata.get("ingestion")
+            ingestion = ingestion if isinstance(ingestion, dict) else {}
+
+            resolved_source_session_id = (
+                str(ingestion.get("source_session_id", "")).strip()
+                or str(metadata.get("source_session_id", "")).strip()
+                or None
+            )
+            resolved_source_conversation_id = (
+                str(ingestion.get("source_conversation_id", "")).strip()
+                or str(metadata.get("source_conversation_id", "")).strip()
+                or None
+            )
+            resolved_import_id = str(ingestion.get("import_id", "")).strip() or None
+            truthful_source = bool(ingestion.get("truthful_source", False))
+
+            if source_conversation_id and resolved_source_conversation_id != source_conversation_id:
+                continue
+            if source_session_id and resolved_source_session_id != source_session_id:
+                continue
+            if import_id and resolved_import_id != import_id:
+                continue
+            if truthful_only and not truthful_source:
+                continue
+
             loop_info = open_loop_participation.get(str(row["entry_id"]))
-            if loop_info and int(loop_info.get("count", 0)) > 0:
-                participating_rows.append(row)
-        participating_rows.sort(
-            key=lambda r: (
-                str(open_loop_participation.get(str(r["entry_id"]), {}).get("last_seen_at", "")),
-                str(r.get("created_at", "")),
-                str(r.get("entry_id", "")),
-            ),
-            reverse=True,
-        )
-        rows = participating_rows[offset : offset + limit]
+            if only_with_open_loops and not (loop_info and int(loop_info.get("count", 0)) > 0):
+                continue
+            filtered_rows.append(row)
+
+        if only_with_open_loops:
+            filtered_rows.sort(
+                key=lambda r: (
+                    str(open_loop_participation.get(str(r["entry_id"]), {}).get("last_seen_at", "")),
+                    str(r.get("created_at", "")),
+                    str(r.get("entry_id", "")),
+                ),
+                reverse=True,
+            )
+        rows = filtered_rows[offset : offset + limit]
         row_offset = offset
     else:
         rows = list_entry_rows(paths.sqlite_path, limit=limit, offset=offset)
@@ -574,6 +1042,24 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     for row in rows:
         raw_file = Path(row["raw_file_path"])
         body = json.loads(raw_file.read_text(encoding="utf-8"))
+        metadata = body.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        ingestion = metadata.get("ingestion")
+        ingestion = ingestion if isinstance(ingestion, dict) else {}
+        provenance = {
+            "truthful_source": bool(ingestion.get("truthful_source", False)),
+            "import_id": str(ingestion.get("import_id", "")).strip() or None,
+            "source_session_id": (
+                str(ingestion.get("source_session_id", "")).strip()
+                or str(metadata.get("source_session_id", "")).strip()
+                or None
+            ),
+            "source_conversation_id": (
+                str(ingestion.get("source_conversation_id", "")).strip()
+                or str(metadata.get("source_conversation_id", "")).strip()
+                or None
+            ),
+        }
         brief = None
         latest_brief_key: tuple[str, str] | None = None
         artifact_dir = paths.artifacts_dir / row["entry_id"]
@@ -581,6 +1067,8 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             for artifact_file in sorted(artifact_dir.glob("*.json")):
                 artifact_body = json.loads(artifact_file.read_text(encoding="utf-8"))
                 if artifact_body.get("artifact_type") == "conversation-brief":
+                    if not _is_artifact_active(artifact_body):
+                        continue
                     key = (
                         str(artifact_body.get("created_at", "")).strip(),
                         str(artifact_body.get("artifact_id", "")).strip(),
@@ -596,6 +1084,7 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "author_role": row["author_role"],
             "brief": brief,
             "preview": _build_preview(str(body.get("content", ""))),
+            "provenance": provenance,
         }
         loop_info = open_loop_participation.get(str(row["entry_id"]))
         if loop_info and int(loop_info.get("count", 0)) > 0:
@@ -607,7 +1096,18 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             }
         items.append(item)
 
-    return {"limit": limit, "offset": row_offset, "items": items}
+    return {
+        "limit": limit,
+        "offset": row_offset,
+        "filters": {
+            "source_conversation_id": source_conversation_id,
+            "source_session_id": source_session_id,
+            "import_id": import_id,
+            "truthful_only": truthful_only,
+            "only_with_open_loops": only_with_open_loops,
+        },
+        "items": items,
+    }
 
 
 def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -615,10 +1115,25 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     fetched = fetch_entry_from_files(
         paths,
         entry_id=str(payload["entry_id"]),
-        include_overlays=False,
+        include_overlays=True,
         include_artifacts=True,
     )
     entry = fetched["entry"]
+    overlays = []
+    for o in fetched.get("overlays", []):
+        overlays.append(
+            {
+                "overlay_id": str(o.get("overlay_id", "")).strip() or o.get("overlay_id"),
+                "overlay_type": str(o.get("overlay_type", "")).strip() or o.get("overlay_type"),
+                "author": str(o.get("author", "")).strip() or o.get("author"),
+                "content": o.get("content", ""),
+                "created_at": o.get("created_at"),
+                "metadata": o.get("metadata", {}),
+            }
+        )
+    overlays.sort(key=lambda o: (str(o.get("created_at", "")), str(o.get("overlay_id", ""))), reverse=True)
+    latest_overlay_at = str(overlays[0].get("created_at", "")).strip() if overlays else None
+    latest_overlay_dt = _parse_iso_timestamp(latest_overlay_at)
     artifacts = []
     seen_artifact_ids: set[str] = set()
     for a in fetched.get("artifacts", []):
@@ -630,6 +1145,7 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "artifact_type": a.get("artifact_type"),
             "producer": a.get("producer"),
             "created_at": a.get("created_at"),
+            "lifecycle_status": _artifact_lifecycle_status(a),
         }
         if a.get("artifact_type") in {"memory", "compressed-memory", "conversation-brief"}:
             artifact["content"] = a.get("content", "")
@@ -644,9 +1160,11 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
                 artifact["open_loops"] = json.loads(str(a.get("content", "{}"))).get("loops", [])
             except json.JSONDecodeError:
                 artifact["open_loops"] = []
+        artifact.update(_overlay_staleness_for_artifact(a, latest_overlay_at, latest_overlay_dt))
         artifacts.append(artifact)
 
     for linked in _find_linked_open_loop_artifacts(paths, entry_id=str(entry["entry_id"]), exclude_artifact_ids=seen_artifact_ids):
+        linked.update(_overlay_staleness_for_artifact(linked, latest_overlay_at, latest_overlay_dt))
         artifacts.append(linked)
 
     artifacts.sort(key=lambda a: (str(a.get("created_at", "")), str(a.get("artifact_id", ""))), reverse=True)
@@ -654,6 +1172,8 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     for artifact in artifacts:
         artifact_type = str(artifact.get("artifact_type", "")).strip()
         if not artifact_type:
+            continue
+        if str(artifact.get("lifecycle_status", "active")).strip() == "superseded":
             continue
         key = (str(artifact.get("created_at", "")), str(artifact.get("artifact_id", "")))
         current = latest_by_type.get(artifact_type)
@@ -663,16 +1183,22 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         artifact_type = str(artifact.get("artifact_type", "")).strip()
         if not artifact_type:
             continue
+        if str(artifact.get("lifecycle_status", "active")).strip() == "superseded":
+            artifact["is_current"] = False
+            continue
         key = (str(artifact.get("created_at", "")), str(artifact.get("artifact_id", "")))
-        artifact["is_current"] = key == latest_by_type.get(artifact_type)
+        selected = latest_by_type.get(artifact_type)
+        artifact["is_current"] = key == selected if selected is not None else True
 
     return {
         "entry_id": entry["entry_id"],
         "raw_entry": entry,
+        "overlays": overlays,
         "artifacts": artifacts,
         "truth_model": {
             "primary": "raw_entry",
             "secondary": "artifacts",
+            "overlay_layer": "overlays",
         },
     }
 
@@ -711,6 +1237,7 @@ def _find_linked_open_loop_artifacts(paths: Paths, *, entry_id: str, exclude_art
                     "anchor_entry_id": str(body.get("entry_id", "")),
                     "source_entry_ids": source_entry_ids,
                 },
+                "lifecycle_status": _artifact_lifecycle_status(body),
             }
         )
     linked.sort(key=lambda a: (str(a.get("created_at", "")), str(a.get("artifact_id", ""))), reverse=True)
@@ -721,19 +1248,21 @@ def produce_open_loops(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     limit = int(payload.get("limit", 20))
     if limit < 1:
         raise ValueError("limit must be >= 1")
-    entry_ids = payload.get("entry_ids")
-    normalized_entry_ids: list[str] | None = None
-    if entry_ids:
-        if not isinstance(entry_ids, list):
-            raise ValueError("entry_ids must be a list when provided")
-        normalized_entry_ids = [str(e).strip() for e in entry_ids if str(e).strip()]
+    normalized_entry_ids, selection = _resolve_producer_entry_ids(paths, payload=payload, limit=limit)
 
     source_rows = collect_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
     if not source_rows:
         raise FileNotFoundError("no source entries found for open-loop analysis")
 
     source_entry_ids = [str(r["entry_id"]) for r in source_rows]
-    payload_content = build_open_loops_payload(source_entries=source_rows)
+    source_rows_with_effective = [
+        {
+            **row,
+            "_effective_body": _effective_entry_body_from_row(paths, row),
+        }
+        for row in source_rows
+    ]
+    payload_content = build_open_loops_payload(source_entries=source_rows_with_effective)
     newest_row = max(source_rows, key=lambda r: (r["created_at"], r["entry_id"]))
     generated_at = datetime.now(timezone.utc).isoformat()
 
@@ -761,6 +1290,8 @@ def produce_open_loops(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         "artifact_file": attached["artifact_file"],
         "loop_count": len(payload_content["loops"]),
         "source_entry_ids": source_entry_ids,
+        "selection_mode": selection["selection_mode"],
+        "filters": selection["filters"],
     }
 
 
@@ -768,12 +1299,7 @@ def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[s
     limit = int(payload.get("limit", 20))
     if limit < 1:
         raise ValueError("limit must be >= 1")
-    entry_ids = payload.get("entry_ids")
-    normalized_entry_ids: list[str] | None = None
-    if entry_ids:
-        if not isinstance(entry_ids, list):
-            raise ValueError("entry_ids must be a list when provided")
-        normalized_entry_ids = [str(e).strip() for e in entry_ids if str(e).strip()]
+    normalized_entry_ids, selection = _resolve_producer_entry_ids(paths, payload=payload, limit=limit)
     force = bool(payload.get("force", False))
 
     source_rows = collect_brief_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
@@ -787,7 +1313,7 @@ def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[s
         if not force and entry_has_artifact_type(paths, entry_id=entry_id, artifact_type="conversation-brief"):
             skipped.append(entry_id)
             continue
-        body = json.loads(Path(row["raw_file_path"]).read_text(encoding="utf-8"))
+        body = _effective_entry_body_from_row(paths, row)
         brief = build_conversation_brief_text(body)
         attached = attach_artifact(
             paths,
@@ -816,6 +1342,8 @@ def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[s
         "skipped_count": len(skipped),
         "produced": produced,
         "skipped": skipped,
+        "selection_mode": selection["selection_mode"],
+        "filters": selection["filters"],
     }
 
 
@@ -823,12 +1351,7 @@ def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str
     limit = int(payload.get("limit", 20))
     if limit < 1:
         raise ValueError("limit must be >= 1")
-    entry_ids = payload.get("entry_ids")
-    normalized_entry_ids: list[str] | None = None
-    if entry_ids:
-        if not isinstance(entry_ids, list):
-            raise ValueError("entry_ids must be a list when provided")
-        normalized_entry_ids = [str(e).strip() for e in entry_ids if str(e).strip()]
+    normalized_entry_ids, selection = _resolve_producer_entry_ids(paths, payload=payload, limit=limit)
     force = bool(payload.get("force", False))
 
     source_rows = collect_memory_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
@@ -842,7 +1365,7 @@ def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str
         if not force and entry_has_memory_artifact_type(paths, entry_id=entry_id, artifact_type="compressed-memory"):
             skipped.append(entry_id)
             continue
-        body = json.loads(Path(row["raw_file_path"]).read_text(encoding="utf-8"))
+        body = _effective_entry_body_from_row(paths, row)
         memory_text = build_compressed_memory_text(body)
         attached = attach_artifact(
             paths,
@@ -871,6 +1394,8 @@ def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str
         "skipped_count": len(skipped),
         "produced": produced,
         "skipped": skipped,
+        "selection_mode": selection["selection_mode"],
+        "filters": selection["filters"],
     }
 
 

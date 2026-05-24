@@ -89,6 +89,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _entry_row_to_body(row: dict[str, Any]) -> dict[str, Any]:
+    effective = row.get("_effective_body")
+    if isinstance(effective, dict):
+        return effective
     raw_file = Path(row["raw_file_path"])
     return _read_json(raw_file)
 

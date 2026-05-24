@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import sqlite3
 import re
 from pathlib import Path
@@ -9,7 +10,7 @@ from agent_diary.models.types import Artifact, RawEntry
 
 
 def insert_entry(db_path: Path, entry: RawEntry, raw_file_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             INSERT INTO entries(entry_id, created_at, title, source, author_role, raw_file_path)
@@ -21,7 +22,7 @@ def insert_entry(db_path: Path, entry: RawEntry, raw_file_path: str) -> None:
 
 
 def insert_artifact(db_path: Path, artifact: Artifact) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             INSERT INTO artifacts(artifact_id, entry_id, created_at, artifact_type, producer, content)
@@ -48,7 +49,7 @@ def search_memory(db_path: Path, query: str, limit: int = 20) -> list[dict[str, 
     like_params = [f"%{t}%" for t in terms]
     where_clause = " OR ".join(["LOWER(mi.memory_text) LIKE ?"] * len(like_params))
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
@@ -93,7 +94,7 @@ def search_memory(db_path: Path, query: str, limit: int = 20) -> list[dict[str, 
 
 
 def get_entry_row(db_path: Path, entry_id: str) -> dict[str, Any] | None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
@@ -107,7 +108,7 @@ def get_entry_row(db_path: Path, entry_id: str) -> dict[str, Any] | None:
 
 
 def list_entry_rows(db_path: Path, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -129,7 +130,7 @@ def insert_memory_index_row(
     created_at: str,
     memory_text: str,
 ) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute(
             """
             INSERT INTO memory_index(entry_id, artifact_id, created_at, memory_text, tags)
