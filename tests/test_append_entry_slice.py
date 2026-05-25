@@ -1092,12 +1092,21 @@ class AppendEntrySliceTests(unittest.TestCase):
                 "producer": "conversation-brief.v1",
                 "content": "Bill asks for a May 7 rundown and Tom responds with a concise recap.",
                 "created_at": "2026-05-23T11:01:00+00:00",
+                "metadata": {
+                    "schema_version": "conversation-brief.v1",
+                    "method": "deterministic-dialogue-brief-v1",
+                    "source_entry_id": entry["entry_id"],
+                },
             },
         )
 
         detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
         brief = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "conversation-brief"][0]
         self.assertIn("May 7 rundown", brief["content"])
+        provenance = brief.get("provenance", {})
+        self.assertEqual(provenance.get("schema_version"), "conversation-brief.v1")
+        self.assertEqual(provenance.get("method"), "deterministic-dialogue-brief-v1")
+        self.assertEqual(provenance.get("source_entry_ids"), [entry["entry_id"]])
 
     def test_fetch_entry_detail_marks_latest_artifact_as_current_per_type(self) -> None:
         entry = append_entry(
@@ -1172,6 +1181,43 @@ class AppendEntrySliceTests(unittest.TestCase):
         superseded_memory = [a for a in memories if not a.get("is_current")][0]
         self.assertEqual(superseded_memory["lifecycle_status"], "superseded")
         self.assertEqual(current_memory["lifecycle_status"], "active")
+
+    def test_fetch_entry_detail_includes_open_loop_provenance_for_multi_entry_artifact(self) -> None:
+        e1 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "TODO: follow up on budget decision this week.",
+                "created_at": "2026-05-23T12:30:00+00:00",
+            },
+        )
+        e2 = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Pending: next step is to confirm budget approval timing.",
+                "created_at": "2026-05-23T12:31:00+00:00",
+            },
+        )
+        produced = produce_open_loops(self.paths, {"entry_ids": [e1["entry_id"], e2["entry_id"]], "limit": 10})
+        self.assertGreaterEqual(produced["loop_count"], 1)
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": e1["entry_id"]})
+        open_loop = [a for a in detail["artifacts"] if a["artifact_type"] == "analysis:open-loop"][0]
+        provenance = open_loop.get("provenance", {})
+        self.assertEqual(provenance.get("schema_version"), "open-loop.v1")
+        self.assertEqual(provenance.get("method"), "keyword-window-v1")
+        self.assertEqual(provenance.get("method_version"), "1")
+        self.assertTrue(str(provenance.get("generated_at", "")).strip())
+        self.assertEqual(
+            sorted(provenance.get("source_entry_ids", [])),
+            sorted([e1["entry_id"], e2["entry_id"]]),
+        )
+        self.assertIsInstance(provenance.get("analysis_window"), dict)
 
     def test_fetch_entry_detail_marks_artifact_overlay_stale_when_overlay_is_newer(self) -> None:
         entry = append_entry(

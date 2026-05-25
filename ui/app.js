@@ -219,6 +219,38 @@ function buildOverlayStalenessHtml(artifact) {
   `;
 }
 
+function buildSourceEntryLinksHtml(sourceEntryIds) {
+  const ids = Array.isArray(sourceEntryIds) ? sourceEntryIds.filter((id) => String(id || "").trim()) : [];
+  if (!ids.length) {
+    return '<span class="muted">none</span>';
+  }
+  return ids
+    .map((id) => `<button class="support-link" type="button" data-support-entry-id="${id}">${id}</button>`)
+    .join(" ");
+}
+
+function buildProvenanceHtml(artifact) {
+  const p = artifact?.provenance || {};
+  const rows = [];
+  if (p.schema_version) rows.push(`<div class="muted"><strong>schema:</strong> ${p.schema_version}</div>`);
+  if (p.method) rows.push(`<div class="muted"><strong>method:</strong> ${p.method}</div>`);
+  if (p.method_version) rows.push(`<div class="muted"><strong>method version:</strong> ${p.method_version}</div>`);
+  if (p.generated_at) rows.push(`<div class="muted"><strong>generated:</strong> ${formatMetaDateTime(p.generated_at)}</div>`);
+  if (p.analysis_window && (p.analysis_window.start || p.analysis_window.end)) {
+    rows.push(
+      `<div class="muted"><strong>window:</strong> ${p.analysis_window.start || "?"} → ${p.analysis_window.end || "?"}</div>`
+    );
+  }
+  const sourceIdsHtml = buildSourceEntryLinksHtml(p.source_entry_ids);
+  rows.push(`<div class="muted"><strong>source entries:</strong> <span class="support-links">${sourceIdsHtml}</span></div>`);
+  return `
+    <div class="provenance-block">
+      <div class="derived-badge">Provenance</div>
+      ${rows.join("")}
+    </div>
+  `;
+}
+
 function normalizeSpeakerLabel(label) {
   return String(label || "")
     .trim()
@@ -360,6 +392,9 @@ function renderDetail(detail) {
     content.className = "artifact-body";
     content.textContent = currentBrief.content || "";
     briefBody.appendChild(content);
+    const provenance = document.createElement("div");
+    provenance.innerHTML = buildProvenanceHtml(currentBrief);
+    briefBody.appendChild(provenance);
     if (currentBrief.overlay_stale === true) {
       const stale = document.createElement("div");
       stale.innerHTML = buildOverlayStalenessHtml(currentBrief);
@@ -383,9 +418,17 @@ function renderDetail(detail) {
       <div><strong>${artifact.artifact_type || "compressed-memory"}</strong></div>
       <div class="muted">${formatMetaDateTime(artifact.created_at || "")}</div>
       <div class="muted">producer: ${artifact.producer || ""}</div>
+      ${buildProvenanceHtml(artifact)}
       ${buildOverlayStalenessHtml(artifact)}
       <pre class="artifact-body">${artifact.content || ""}</pre>
     `;
+    for (const btn of li.querySelectorAll("button[data-support-entry-id]")) {
+      btn.addEventListener("click", async () => {
+        const id = btn.getAttribute("data-support-entry-id");
+        if (!id) return;
+        await loadEntry(id);
+      });
+    }
     memoryArtifactList.appendChild(li);
   }
   memoryDetails.hidden = true;
@@ -455,6 +498,8 @@ function renderDetail(detail) {
       <div class="muted">${formatMetaDateTime(artifact.created_at || "")}</div>
       <div class="muted">producer: ${artifact.producer || ""}</div>
       <div class="muted">id: ${artifact.artifact_id || ""}</div>
+      <div class="muted">status: ${artifact.lifecycle_status || "active"}${artifact.is_current ? " · current" : ""}</div>
+      ${buildProvenanceHtml(artifact)}
       ${buildOverlayStalenessHtml(artifact)}
       ${openLoopHtml}
     `;
@@ -466,6 +511,13 @@ function renderDetail(detail) {
       });
     }
     artifactList.appendChild(li);
+  }
+  for (const btn of briefBody.querySelectorAll("button[data-support-entry-id]")) {
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-support-entry-id");
+      if (!id) return;
+      await loadEntry(id);
+    });
   }
   artifactDetails.open = secondaryArtifacts.length > 0;
 }

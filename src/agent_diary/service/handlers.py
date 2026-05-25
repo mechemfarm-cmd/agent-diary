@@ -808,6 +808,32 @@ def _overlay_staleness_for_artifact(
     return result
 
 
+def _artifact_provenance_summary(
+    artifact_body: dict[str, Any],
+    *,
+    fallback_entry_id: str,
+    lineage_source_entry_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    metadata = artifact_body.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    source_entry_ids = [str(e).strip() for e in metadata.get("source_entry_ids", []) if str(e).strip()]
+    source_entry_id = str(metadata.get("source_entry_id", "")).strip()
+    if source_entry_id and source_entry_id not in source_entry_ids:
+        source_entry_ids.append(source_entry_id)
+    if not source_entry_ids and lineage_source_entry_ids:
+        source_entry_ids = [str(e).strip() for e in lineage_source_entry_ids if str(e).strip()]
+    if not source_entry_ids:
+        source_entry_ids = [fallback_entry_id]
+    return {
+        "schema_version": str(metadata.get("schema_version", "")).strip() or None,
+        "method": str(metadata.get("method", "")).strip() or None,
+        "method_version": str(metadata.get("method_version", "")).strip() or None,
+        "generated_at": str(metadata.get("generated_at", "")).strip() or None,
+        "analysis_window": metadata.get("analysis_window") if isinstance(metadata.get("analysis_window"), dict) else None,
+        "source_entry_ids": source_entry_ids,
+    }
+
+
 def _resolve_entry_provenance_from_body(body: dict[str, Any]) -> dict[str, Any]:
     metadata = body.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
@@ -1146,6 +1172,7 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "producer": a.get("producer"),
             "created_at": a.get("created_at"),
             "lifecycle_status": _artifact_lifecycle_status(a),
+            "provenance": _artifact_provenance_summary(a, fallback_entry_id=str(entry["entry_id"])),
         }
         if a.get("artifact_type") in {"memory", "compressed-memory", "conversation-brief"}:
             artifact["content"] = a.get("content", "")
@@ -1232,6 +1259,11 @@ def _find_linked_open_loop_artifacts(paths: Paths, *, entry_id: str, exclude_art
                 "producer": body.get("producer"),
                 "created_at": body.get("created_at"),
                 "open_loops": open_loops,
+                "provenance": _artifact_provenance_summary(
+                    body,
+                    fallback_entry_id=entry_id,
+                    lineage_source_entry_ids=source_entry_ids,
+                ),
                 "lineage": {
                     "link_mode": "lineage",
                     "anchor_entry_id": str(body.get("entry_id", "")),
