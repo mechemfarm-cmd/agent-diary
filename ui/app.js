@@ -400,7 +400,7 @@ function renderDetail(detail) {
       stale.innerHTML = buildOverlayStalenessHtml(currentBrief);
       briefBody.appendChild(stale);
     }
-    briefDetails.open = true;
+    briefDetails.open = false;
   } else {
     briefBody.textContent = "No conversation brief is attached to this entry yet.";
     briefDetails.open = false;
@@ -448,7 +448,7 @@ function renderDetail(detail) {
     `;
     overlayList.appendChild(li);
   }
-  overlayDetails.open = overlays.length > 0;
+  overlayDetails.open = false;
 
   artifactList.innerHTML = "";
   if (!secondaryArtifacts.length) {
@@ -519,7 +519,7 @@ function renderDetail(detail) {
       await loadEntry(id);
     });
   }
-  artifactDetails.open = secondaryArtifacts.length > 0;
+  artifactDetails.open = false;
 }
 
 function summarizePreview(text, size = 140) {

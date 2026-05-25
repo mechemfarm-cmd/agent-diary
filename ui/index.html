@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent Diary UI Shell</title>
-    <link rel="stylesheet" href="./styles.css?v=20260522o" />
+    <link rel="stylesheet" href="./styles.css?v=20260525r1" />
   </head>
   <body>
     <a class="skip-link" href="#detailBody">Skip to diary entry</a>
@@ -28,91 +28,95 @@
     </header>
 
     <main class="layout" role="main">
-      <section class="panel panel-search" aria-labelledby="searchHeading">
-        <h2 id="searchHeading">Search</h2>
-        <form id="searchForm" class="search-form" role="search" aria-label="Search memory">
-          <label for="searchInput" class="sr-only">Search memory</label>
-          <input id="searchInput" type="text" placeholder="Search memory..." required />
-          <button type="submit">Search</button>
-        </form>
-        <p id="searchStatus" class="status-line" role="status" aria-live="polite"></p>
-        <ul id="searchResults" class="list scroll-list" role="list" aria-label="Search result entries"></ul>
-      </section>
-
-      <section class="panel panel-timeline" aria-labelledby="timelineHeading">
-        <h2 id="timelineHeading">Timeline</h2>
-        <form id="browseScopeForm" class="browse-scope" aria-label="Timeline browse scope">
-          <label for="scopeConversationId">Conversation</label>
-          <input id="scopeConversationId" type="text" placeholder="telegram:713733361" />
-          <label for="scopeImportId">Import</label>
-          <input id="scopeImportId" type="text" placeholder="import-telegram-direct-..." />
-          <label class="scope-toggle">
-            <input id="scopeTruthfulOnly" type="checkbox" />
-            Truthful only
-          </label>
-          <button type="submit">Apply</button>
-          <button id="clearScopeBtn" type="button">Clear</button>
-        </form>
-        <div class="panel-actions">
-          <button id="prevPageBtn" aria-label="Previous timeline page">Prev</button>
-          <button id="nextPageBtn" aria-label="Next timeline page">Next</button>
-          <button id="refreshImportsBtn" aria-label="Refresh import batches">Refresh Imports</button>
-        </div>
-        <section class="import-inspector" aria-labelledby="importsHeading">
-          <h3 id="importsHeading">Recent Imports</h3>
-          <p id="importsStatus" class="status-line" role="status" aria-live="polite"></p>
-          <ul id="importsList" class="list import-list" role="list" aria-label="Recent import batches"></ul>
+      <aside class="nav-column" aria-label="Search and timeline navigation">
+        <section class="panel panel-search" aria-labelledby="searchHeading">
+          <h2 id="searchHeading">Search</h2>
+          <form id="searchForm" class="search-form" role="search" aria-label="Search memory">
+            <label for="searchInput" class="sr-only">Search memory</label>
+            <input id="searchInput" type="text" placeholder="Search memory..." required />
+            <button type="submit">Search</button>
+          </form>
+          <p id="searchStatus" class="status-line" role="status" aria-live="polite"></p>
+          <ul id="searchResults" class="list scroll-list" role="list" aria-label="Search result entries"></ul>
         </section>
-        <p id="timelineStatus" class="status-line" role="status" aria-live="polite"></p>
-        <ul id="timelineList" class="list scroll-list" role="list" aria-label="Diary timeline entries"></ul>
-      </section>
+
+        <section class="panel panel-timeline" aria-labelledby="timelineHeading">
+          <h2 id="timelineHeading">Timeline</h2>
+          <form id="browseScopeForm" class="browse-scope" aria-label="Timeline browse scope">
+            <label for="scopeConversationId">Conversation</label>
+            <input id="scopeConversationId" type="text" placeholder="telegram:713733361" />
+            <label for="scopeImportId">Import</label>
+            <input id="scopeImportId" type="text" placeholder="import-telegram-direct-..." />
+            <label class="scope-toggle">
+              <input id="scopeTruthfulOnly" type="checkbox" />
+              Truthful only
+            </label>
+            <button type="submit">Apply</button>
+            <button id="clearScopeBtn" type="button">Clear</button>
+          </form>
+          <div class="panel-actions">
+            <button id="prevPageBtn" aria-label="Previous timeline page">Prev</button>
+            <button id="nextPageBtn" aria-label="Next timeline page">Next</button>
+            <button id="refreshImportsBtn" aria-label="Refresh import batches">Refresh Imports</button>
+          </div>
+          <section class="import-inspector" aria-labelledby="importsHeading">
+            <h3 id="importsHeading">Recent Imports</h3>
+            <p id="importsStatus" class="status-line" role="status" aria-live="polite"></p>
+            <ul id="importsList" class="list import-list" role="list" aria-label="Recent import batches"></ul>
+          </section>
+          <p id="timelineStatus" class="status-line" role="status" aria-live="polite"></p>
+          <ul id="timelineList" class="list scroll-list" role="list" aria-label="Diary timeline entries"></ul>
+        </section>
+      </aside>
 
       <section class="panel panel-detail" aria-labelledby="detailHeading">
         <h2 id="detailHeading">Diary Entry</h2>
         <p id="detailStatus" class="status-line" role="status" aria-live="polite"></p>
         <div id="detailMeta" class="meta" aria-label="Entry metadata"></div>
-        <details id="briefDetails" aria-label="Conversation brief layer">
-          <summary>Conversation Brief</summary>
-          <div id="briefBody" class="brief-detail">No conversation brief is attached to this entry yet.</div>
-        </details>
-        <details id="memoryDetails" aria-label="Compressed memory layer" hidden>
-          <summary>Compressed Memory (Agent Layer)</summary>
-          <ul id="memoryArtifactList" class="list secondary layer-list" role="list" aria-label="Compressed memory artifacts"></ul>
-        </details>
-        <details id="overlayDetails" aria-label="Overlay annotations">
-          <summary>Overlays (Annotations / Corrections)</summary>
-          <form id="overlayForm" class="overlay-form" aria-label="Add overlay annotation">
-            <label for="overlayType">Type</label>
-            <select id="overlayType">
-              <option value="annotation">annotation</option>
-              <option value="correction">correction</option>
-            </select>
-            <label for="overlayAuthor">Author</label>
-            <input id="overlayAuthor" type="text" placeholder="operator" required />
-            <label for="overlayContent">Content</label>
-            <textarea id="overlayContent" rows="3" placeholder="Add annotation or correction..." required></textarea>
-            <button id="overlaySubmitBtn" type="submit">Add Overlay</button>
-          </form>
-          <p id="overlayStatus" class="status-line" role="status" aria-live="polite"></p>
-          <ul id="overlayList" class="list secondary layer-list" role="list" aria-label="Entry overlays"></ul>
-        </details>
-        <details id="refreshDerivedDetails" aria-label="Refresh derived layers">
-          <summary>Refresh Derived Layers</summary>
-          <div class="refresh-derived-actions">
-            <button id="refreshOpenLoopsBtn" type="button">Refresh Open Loops</button>
-            <button id="refreshBriefsBtn" type="button">Refresh Conversation Briefs</button>
-            <button id="refreshMemoryBtn" type="button">Refresh Compressed Memory</button>
-          </div>
-          <p id="refreshDerivedStatus" class="status-line" role="status" aria-live="polite"></p>
-        </details>
         <article id="detailBody" class="raw-body" tabindex="-1">Select an entry to view raw detail.</article>
-        <details id="artifactDetails" aria-label="Secondary artifact metadata">
-          <summary>Derived / Support Artifacts</summary>
-          <ul id="artifactList" class="list secondary layer-list" role="list" aria-label="Entry artifacts"></ul>
-        </details>
+        <div class="detail-support-stack" aria-label="Supporting interpretation layers">
+          <details id="briefDetails" aria-label="Conversation brief layer">
+            <summary>Conversation Brief</summary>
+            <div id="briefBody" class="brief-detail">No conversation brief is attached to this entry yet.</div>
+          </details>
+          <details id="memoryDetails" aria-label="Compressed memory layer" hidden>
+            <summary>Compressed Memory (Agent Layer)</summary>
+            <ul id="memoryArtifactList" class="list secondary layer-list" role="list" aria-label="Compressed memory artifacts"></ul>
+          </details>
+          <details id="overlayDetails" aria-label="Overlay annotations">
+            <summary>Overlays (Annotations / Corrections)</summary>
+            <form id="overlayForm" class="overlay-form" aria-label="Add overlay annotation">
+              <label for="overlayType">Type</label>
+              <select id="overlayType">
+                <option value="annotation">annotation</option>
+                <option value="correction">correction</option>
+              </select>
+              <label for="overlayAuthor">Author</label>
+              <input id="overlayAuthor" type="text" placeholder="operator" required />
+              <label for="overlayContent">Content</label>
+              <textarea id="overlayContent" rows="3" placeholder="Add annotation or correction..." required></textarea>
+              <button id="overlaySubmitBtn" type="submit">Add Overlay</button>
+            </form>
+            <p id="overlayStatus" class="status-line" role="status" aria-live="polite"></p>
+            <ul id="overlayList" class="list secondary layer-list" role="list" aria-label="Entry overlays"></ul>
+          </details>
+          <details id="refreshDerivedDetails" aria-label="Refresh derived layers">
+            <summary>Refresh Derived Layers</summary>
+            <div class="refresh-derived-actions">
+              <button id="refreshOpenLoopsBtn" type="button">Refresh Open Loops</button>
+              <button id="refreshBriefsBtn" type="button">Refresh Conversation Briefs</button>
+              <button id="refreshMemoryBtn" type="button">Refresh Compressed Memory</button>
+            </div>
+            <p id="refreshDerivedStatus" class="status-line" role="status" aria-live="polite"></p>
+          </details>
+          <details id="artifactDetails" aria-label="Secondary artifact metadata">
+            <summary>Derived / Support Artifacts</summary>
+            <ul id="artifactList" class="list secondary layer-list" role="list" aria-label="Entry artifacts"></ul>
+          </details>
+        </div>
       </section>
     </main>
 
-    <script type="module" src="./app.js?v=20260522o"></script>
+    <script type="module" src="./app.js?v=20260525r1"></script>
   </body>
 </html>
