@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from agent_diary.config import Paths
 LEDGER_VERSION = 1
 LEDGER_PATH = "ledger.json"
 BATCHES_DIR = "batches"
+IMPORT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def ensure_import_dirs(paths: Paths) -> None:
@@ -80,6 +82,15 @@ def build_source_item_key(entry: dict[str, Any]) -> str:
     return f"{source}::fingerprint::{digest}"
 
 
+def normalize_import_id(import_id: str) -> str:
+    normalized = str(import_id).strip()
+    if not normalized:
+        raise ValueError("import_id is required")
+    if not IMPORT_ID_PATTERN.fullmatch(normalized):
+        raise ValueError("import_id must be a filename-safe id using letters, numbers, dots, underscores, or hyphens")
+    return normalized
+
+
 def write_import_batch_manifest(
     paths: Paths,
     *,
@@ -87,7 +98,8 @@ def write_import_batch_manifest(
     manifest: dict[str, Any],
 ) -> Path:
     ensure_import_dirs(paths)
-    target = paths.imports_dir / BATCHES_DIR / f"{import_id}.json"
+    normalized = normalize_import_id(import_id)
+    target = paths.imports_dir / BATCHES_DIR / f"{normalized}.json"
     target.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     return target
 
@@ -114,9 +126,7 @@ def list_import_batch_manifests(paths: Paths, limit: int = 20) -> list[dict[str,
 
 def load_import_batch_manifest(paths: Paths, import_id: str) -> dict[str, Any]:
     ensure_import_dirs(paths)
-    normalized = str(import_id).strip()
-    if not normalized:
-        raise ValueError("import_id is required")
+    normalized = normalize_import_id(import_id)
     path = paths.imports_dir / BATCHES_DIR / f"{normalized}.json"
     if not path.exists():
         raise FileNotFoundError(f"import batch manifest not found: {normalized}")

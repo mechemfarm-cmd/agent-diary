@@ -8,17 +8,10 @@ import re
 from typing import Any
 from uuid import uuid4
 
-from agent_diary.analytics.conversation_briefs import (
-    build_conversation_brief_text,
-    collect_source_rows as collect_brief_source_rows,
-    entry_has_artifact_type,
-)
-from agent_diary.analytics.compressed_memory import (
-    build_compressed_memory_text,
-    collect_source_rows as collect_memory_source_rows,
-    entry_has_artifact_type as entry_has_memory_artifact_type,
-)
-from agent_diary.analytics.open_loops import build_open_loops_payload, collect_source_rows
+from agent_diary.analytics.common import collect_source_rows, entry_has_active_artifact_type
+from agent_diary.analytics.conversation_briefs import build_conversation_brief_text
+from agent_diary.analytics.compressed_memory import build_compressed_memory_text
+from agent_diary.analytics.open_loops import build_open_loops_payload
 from agent_diary.config import Paths
 from agent_diary.index.repository import (
     get_entry_row,
@@ -36,6 +29,7 @@ from agent_diary.storage.imports import (
     load_import_batch_manifest,
     list_import_batch_manifests,
     load_import_ledger,
+    normalize_import_id,
     save_import_ledger,
     write_import_batch_manifest,
 )
@@ -90,7 +84,7 @@ def import_session_jsonl(paths: Paths, payload: dict[str, Any]) -> dict[str, Any
     if not import_path.exists():
         raise FileNotFoundError(f"import file not found: {import_path}")
 
-    import_id = str(payload.get("import_id") or _make_import_id())
+    import_id = normalize_import_id(str(payload.get("import_id") or _make_import_id()))
     imported_at = _utc_now_iso()
     source_session_id = str(payload.get("source_session_id", "")).strip() or None
     source_conversation_id = str(payload.get("source_conversation_id", "")).strip() or None
@@ -260,9 +254,7 @@ def import_session_and_refresh_derived(paths: Paths, payload: dict[str, Any]) ->
 
 def refresh_derived_for_import(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     _require_fields(payload, ["import_id"])
-    import_id = str(payload["import_id"]).strip()
-    if not import_id:
-        raise ValueError("import_id is required")
+    import_id = normalize_import_id(str(payload["import_id"]))
     dry_run = bool(payload.get("dry_run", False))
     force = bool(payload.get("force", True))
 
@@ -1019,31 +1011,8 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         for row in all_rows:
             raw_file = Path(str(row["raw_file_path"]))
             body = json.loads(raw_file.read_text(encoding="utf-8"))
-            metadata = body.get("metadata")
-            metadata = metadata if isinstance(metadata, dict) else {}
-            ingestion = metadata.get("ingestion")
-            ingestion = ingestion if isinstance(ingestion, dict) else {}
-
-            resolved_source_session_id = (
-                str(ingestion.get("source_session_id", "")).strip()
-                or str(metadata.get("source_session_id", "")).strip()
-                or None
-            )
-            resolved_source_conversation_id = (
-                str(ingestion.get("source_conversation_id", "")).strip()
-                or str(metadata.get("source_conversation_id", "")).strip()
-                or None
-            )
-            resolved_import_id = str(ingestion.get("import_id", "")).strip() or None
-            truthful_source = bool(ingestion.get("truthful_source", False))
-
-            if source_conversation_id and resolved_source_conversation_id != source_conversation_id:
-                continue
-            if source_session_id and resolved_source_session_id != source_session_id:
-                continue
-            if import_id and resolved_import_id != import_id:
-                continue
-            if truthful_only and not truthful_source:
+            provenance = _resolve_entry_provenance_from_body(body)
+            if not _entry_matches_provenance_scope(provenance, filters):
                 continue
 
             loop_info = open_loop_participation.get(str(row["entry_id"]))
@@ -1068,24 +1037,7 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     for row in rows:
         raw_file = Path(row["raw_file_path"])
         body = json.loads(raw_file.read_text(encoding="utf-8"))
-        metadata = body.get("metadata")
-        metadata = metadata if isinstance(metadata, dict) else {}
-        ingestion = metadata.get("ingestion")
-        ingestion = ingestion if isinstance(ingestion, dict) else {}
-        provenance = {
-            "truthful_source": bool(ingestion.get("truthful_source", False)),
-            "import_id": str(ingestion.get("import_id", "")).strip() or None,
-            "source_session_id": (
-                str(ingestion.get("source_session_id", "")).strip()
-                or str(metadata.get("source_session_id", "")).strip()
-                or None
-            ),
-            "source_conversation_id": (
-                str(ingestion.get("source_conversation_id", "")).strip()
-                or str(metadata.get("source_conversation_id", "")).strip()
-                or None
-            ),
-        }
+        provenance = _resolve_entry_provenance_from_body(body)
         brief = None
         latest_brief_key: tuple[str, str] | None = None
         artifact_dir = paths.artifacts_dir / row["entry_id"]
@@ -1334,7 +1286,7 @@ def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[s
     normalized_entry_ids, selection = _resolve_producer_entry_ids(paths, payload=payload, limit=limit)
     force = bool(payload.get("force", False))
 
-    source_rows = collect_brief_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
+    source_rows = collect_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
     if not source_rows:
         raise FileNotFoundError("no source entries found for conversation-brief analysis")
 
@@ -1342,7 +1294,7 @@ def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[s
     skipped: list[str] = []
     for row in source_rows:
         entry_id = str(row["entry_id"])
-        if not force and entry_has_artifact_type(paths, entry_id=entry_id, artifact_type="conversation-brief"):
+        if not force and entry_has_active_artifact_type(paths, entry_id=entry_id, artifact_type="conversation-brief"):
             skipped.append(entry_id)
             continue
         body = _effective_entry_body_from_row(paths, row)
@@ -1386,7 +1338,7 @@ def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str
     normalized_entry_ids, selection = _resolve_producer_entry_ids(paths, payload=payload, limit=limit)
     force = bool(payload.get("force", False))
 
-    source_rows = collect_memory_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
+    source_rows = collect_source_rows(paths, limit=limit, entry_ids=normalized_entry_ids)
     if not source_rows:
         raise FileNotFoundError("no source entries found for compressed-memory analysis")
 
@@ -1394,7 +1346,7 @@ def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str
     skipped: list[str] = []
     for row in source_rows:
         entry_id = str(row["entry_id"])
-        if not force and entry_has_memory_artifact_type(paths, entry_id=entry_id, artifact_type="compressed-memory"):
+        if not force and entry_has_active_artifact_type(paths, entry_id=entry_id, artifact_type="compressed-memory"):
             skipped.append(entry_id)
             continue
         body = _effective_entry_body_from_row(paths, row)

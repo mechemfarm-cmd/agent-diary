@@ -2497,6 +2497,29 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(ingestion["source_session_id"], "session-123")
         self.assertEqual(ingestion["source_conversation_id"], "telegram:713733361")
 
+    def test_import_session_jsonl_rejects_path_like_import_id_before_writes(self) -> None:
+        source_file = self.root / "unsafe-import-id.jsonl"
+        source_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T12:30:00+00:00",
+                    "content": "This should not be written under an unsafe manifest id.",
+                    "metadata": {"source_message_id": "unsafe-import-id-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError):
+            import_session_jsonl(self.paths, {"path": str(source_file), "import_id": "../ledger"})
+
+        self.assertEqual(list(self.paths.entries_dir.glob("**/*.json")), [])
+        self.assertFalse((self.paths.imports_dir / "ledger.json").exists())
+
     def test_import_session_jsonl_skips_duplicate_source_items_on_repeat_run(self) -> None:
         source_file = self.root / "repeat.jsonl"
         source_file.write_text(
@@ -3288,6 +3311,10 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(repeated["derived"]["conversation_briefs"]["status"], "ok")
         self.assertEqual(repeated["derived"]["compressed_memory"]["status"], "ok")
         self.assertEqual(repeated["derived"]["open_loops"]["status"], "ok")
+
+    def test_refresh_derived_for_import_rejects_path_like_import_id(self) -> None:
+        with self.assertRaises(ValueError):
+            refresh_derived_for_import(self.paths, {"import_id": "../ledger"})
 
     def test_import_session_jsonl_dry_run_reports_without_writing_entries(self) -> None:
         source_file = self.root / "dry-run.jsonl"

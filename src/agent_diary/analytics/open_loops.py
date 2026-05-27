@@ -4,11 +4,9 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from agent_diary.config import Paths
-from agent_diary.index.repository import get_entry_row, list_entry_rows
+from agent_diary.analytics.common import collect_source_rows, entry_row_to_body
 
 OPEN_HINTS = (
     "todo",
@@ -84,18 +82,6 @@ class Candidate:
     text: str
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _entry_row_to_body(row: dict[str, Any]) -> dict[str, Any]:
-    effective = row.get("_effective_body")
-    if isinstance(effective, dict):
-        return effective
-    raw_file = Path(row["raw_file_path"])
-    return _read_json(raw_file)
-
-
 def _extract_candidates(entry_id: str, created_at: str, content: str) -> list[Candidate]:
     snippets: list[Candidate] = []
     content_lower = content.lower()
@@ -164,7 +150,7 @@ def build_open_loops_payload(
 ) -> dict[str, Any]:
     groups: dict[str, list[Candidate]] = {}
     for row in source_entries:
-        body = _entry_row_to_body(row)
+        body = entry_row_to_body(row)
         entry_id = str(body["entry_id"])
         created_at = str(body["created_at"])
         content = str(body.get("content", ""))
@@ -208,20 +194,3 @@ def build_open_loops_payload(
 
     loops.sort(key=lambda l: (l["last_seen_at"], l["loop_id"]), reverse=True)
     return {"loops": loops}
-
-
-def collect_source_rows(
-    paths: Paths,
-    *,
-    limit: int,
-    entry_ids: list[str] | None,
-) -> list[dict[str, Any]]:
-    if entry_ids:
-        rows: list[dict[str, Any]] = []
-        for entry_id in entry_ids:
-            row = get_entry_row(paths.sqlite_path, entry_id)
-            if row is not None:
-                rows.append(row)
-        rows.sort(key=lambda r: (r["created_at"], r["entry_id"]), reverse=True)
-        return rows[:limit]
-    return list_entry_rows(paths.sqlite_path, limit=limit, offset=0)
