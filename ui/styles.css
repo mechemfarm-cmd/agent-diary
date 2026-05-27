@@ -68,8 +68,9 @@ body {
     radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.6), transparent 18%),
     linear-gradient(180deg, var(--bg-top) 0%, #ead7b8 35%, var(--bg-bottom) 100%);
   color: var(--ink);
-  overflow: hidden;
+  overflow: auto;
 }
+
 
 body::before {
   content: "";
@@ -120,6 +121,7 @@ body::after {
   z-index: 10;
   overflow: hidden;
 }
+
 
 .topbar::before,
 .topbar::after {
@@ -409,10 +411,22 @@ body::after {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(0, 0.9fr) minmax(0, 0.9fr) minmax(0, 1.9fr);
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
   gap: 14px;
-  padding: 18px;
+  padding: 14px;
   flex: 1 1 auto;
+  min-height: 0;
+  align-items: start;
+}
+
+.nav-column {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 12px;
+  min-height: 0;
+}
+
+.nav-column .panel {
   min-height: 0;
 }
 
@@ -432,6 +446,7 @@ body::after {
   overflow: hidden;
   min-width: 0;
 }
+
 
 .panel::before {
   content: "❦";
@@ -455,6 +470,25 @@ body::after {
 
 .panel-detail {
   min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(320px, auto) auto;
+  gap: 10px;
+  overflow: visible;
+}
+
+#detailBody {
+  width: 100%;
+  max-width: none;
+  min-height: 420px;
+  margin: 0;
+  padding: 18px 20px;
+  line-height: 1.74;
+  overflow: visible;
+}
+
+.detail-support-stack {
+  border-top: 1px solid rgba(185, 141, 100, 0.45);
+  padding-top: 8px;
 }
 
 .panel h2 {
@@ -587,11 +621,11 @@ body::after {
 }
 
 .item button.active {
-  outline: 2px solid var(--accent);
+  outline: 2px solid #2b6f6b;
   border-radius: 12px;
   padding: 2px;
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, rgba(227, 241, 239, 0.9) 100%);
+    linear-gradient(180deg, rgba(236, 247, 246, 0.98) 0%, rgba(222, 240, 238, 0.94) 100%);
 }
 
 :focus-visible {
@@ -627,6 +661,7 @@ body::after {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+
 
 .meta {
   display: flex;
@@ -773,15 +808,17 @@ body::after {
 }
 
 .panel-detail details {
-  margin-top: 14px;
-  border-top: 1px dashed rgba(185, 141, 100, 0.7);
-  padding-top: 10px;
+  margin-top: 6px;
+  border-top: 0;
+  padding-top: 6px;
 }
 
 .panel-detail summary {
   color: var(--muted);
   cursor: pointer;
-  font-size: 0.82rem;
+  font-size: 0.77rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
 .derived-badge {
@@ -980,6 +1017,12 @@ button:focus-visible,
     grid-template-columns: 1fr;
     gap: 10px;
     padding: 10px;
+    min-height: 0;
+    height: auto;
+  }
+
+  .nav-column {
+    grid-template-rows: auto auto;
   }
 
   .layout::before,
