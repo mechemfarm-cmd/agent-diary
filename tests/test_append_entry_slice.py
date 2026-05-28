@@ -659,9 +659,61 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "overlay-search-token", "limit": 5})
         self.assertEqual(results["match_summary"]["compressed_memory_hits"], 0)
-        self.assertTrue(results["match_summary"]["using_fallback"])
+        self.assertEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(len(results["matches"]), 1)
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
+
+    def test_search_memory_merges_raw_and_compressed_hits_per_entry(self) -> None:
+        raw_first = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Ship the exact phrase mac-side route before noon.",
+                "created_at": "2026-05-22T10:06:00+00:00",
+            },
+        )
+        compressed_only = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "raw body without the target phrase",
+                "created_at": "2026-05-22T10:07:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": raw_first["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "agent-v1",
+                "content": "summary mentions route planning in softer terms",
+                "created_at": "2026-05-22T10:08:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": compressed_only["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "agent-v1",
+                "content": "compressed memory explicitly mentions mac-side route work",
+                "created_at": "2026-05-22T10:09:00+00:00",
+            },
+        )
+
+        results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
+        self.assertEqual(results["matches"][0]["entry_id"], raw_first["entry_id"])
+        self.assertEqual(results["matches"][0]["match_layer"], "raw_entry_fallback")
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
+        self.assertIn("raw_entry", results["matches"][0]["supporting_layers"])
+        self.assertEqual(results["match_summary"]["compressed_memory_hits"], 2)
+        self.assertEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertEqual(results["match_summary"]["entry_matches"], 2)
 
     def test_search_memory_filters_compressed_hits_by_source_conversation_id(self) -> None:
         source_file_a = self.root / "search-compressed-scope-a.jsonl"
@@ -747,6 +799,66 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(results["matches"][0]["entry_id"], entry_id_a)
         self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
 
+    def test_search_memory_scope_recall_scans_older_entries_outside_recent_global_slice(self) -> None:
+        older_file = self.root / "search-scope-older.jsonl"
+        older_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T09:00:00+00:00",
+                    "content": "older scoped raw body without the phrase",
+                    "metadata": {"source_message_id": "older-scope-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        imported = import_session_jsonl(
+            self.paths,
+            {
+                "path": str(older_file),
+                "import_id": "import-search-scope-older",
+                "source_session_id": "session-search-scope-older",
+                "source_conversation_id": "telegram:scope-older",
+            },
+        )
+        entry_id = imported["imported"][0]["entry_id"]
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry_id,
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "scope-needle-rare appears only in this older scoped conversation",
+                "created_at": "2026-05-25T09:01:00+00:00",
+            },
+        )
+        for idx in range(260):
+            append_entry(
+                self.paths,
+                {
+                    "entry_type": "manual_note",
+                    "source": "cli",
+                    "author_role": "human",
+                    "content": f"newer unrelated filler note {idx}",
+                    "created_at": f"2026-05-25T12:{idx % 60:02d}:00+00:00",
+                },
+            )
+
+        results = search_memory(
+            self.paths,
+            {
+                "query": "scope-needle-rare",
+                "limit": 10,
+                "source_conversation_id": "telegram:scope-older",
+            },
+        )
+        self.assertEqual(len(results["matches"]), 1)
+        self.assertEqual(results["matches"][0]["entry_id"], entry_id)
+        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+
     def test_search_memory_raw_fallback_respects_import_id_and_truthful_only(self) -> None:
         imported_file_a = self.root / "search-fallback-import-a.jsonl"
         imported_file_a.write_text(
@@ -817,7 +929,7 @@ class AppendEntrySliceTests(unittest.TestCase):
             },
         )
         self.assertEqual(scoped["match_summary"]["compressed_memory_hits"], 0)
-        self.assertTrue(scoped["match_summary"]["using_fallback"])
+        self.assertTrue(scoped["match_summary"]["using_raw_layer"])
         self.assertEqual(len(scoped["matches"]), 1)
         self.assertEqual(scoped["matches"][0]["entry_id"], imported_a["imported"][0]["entry_id"])
 
@@ -1072,6 +1184,10 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(artifact["artifact_id"], attached["artifact_id"])
         self.assertEqual(artifact["artifact_type"], "memory")
         self.assertEqual(artifact["producer"], "agent-v1")
+        self.assertEqual(detail["artifact_summary"]["total_count"], 1)
+        self.assertEqual(detail["artifact_summary"]["current_count"], 1)
+        self.assertEqual(detail["artifact_summary"]["artifact_types"], ["memory"])
+        self.assertEqual(detail["artifact_summary"]["current_by_type"]["memory"]["artifact_id"], attached["artifact_id"])
 
     def test_fetch_entry_detail_includes_conversation_brief_content(self) -> None:
         entry = append_entry(
@@ -1107,6 +1223,7 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(provenance.get("schema_version"), "conversation-brief.v1")
         self.assertEqual(provenance.get("method"), "deterministic-dialogue-brief-v1")
         self.assertEqual(provenance.get("source_entry_ids"), [entry["entry_id"]])
+        self.assertEqual(detail["entry_provenance"]["source_conversation_id"], None)
 
     def test_fetch_entry_detail_marks_latest_artifact_as_current_per_type(self) -> None:
         entry = append_entry(
@@ -1258,6 +1375,7 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(artifact["overlay_stale_reason"], "overlay_added_after_artifact_generation")
         self.assertEqual(artifact["latest_overlay_at"], "2026-05-23T10:06:00+00:00")
         self.assertEqual(artifact["artifact_generated_at"], "2026-05-23T10:05:00+00:00")
+        self.assertEqual(detail["artifact_summary"]["stale_count"], 1)
 
     def test_fetch_entry_detail_overlay_staleness_false_without_overlays(self) -> None:
         entry = append_entry(
@@ -1895,9 +2013,10 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "May 7 microcontractor", "limit": 5})
         self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
-        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
-        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn(results["matches"][0]["match_layer"], {"compressed_memory", "raw_entry_fallback"})
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
 
     def test_produce_compressed_memory_representative_transcript_improves_search_handles(self) -> None:
         entry = append_entry(
@@ -1920,10 +2039,11 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
         self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
-        self.assertEqual(results["match_summary"]["raw_entry_fallback_hits"], 0)
-        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertGreaterEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
-        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn(results["matches"][0]["match_layer"], {"compressed_memory", "raw_entry_fallback"})
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
         self.assertIn("mac-side route", results["matches"][0]["match_text"].lower())
 
     def test_produce_compressed_memory_search_portable_with_non_bill_tom_names(self) -> None:
@@ -1947,10 +2067,11 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
         self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
-        self.assertEqual(results["match_summary"]["raw_entry_fallback_hits"], 0)
-        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertGreaterEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
-        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn(results["matches"][0]["match_layer"], {"compressed_memory", "raw_entry_fallback"})
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
         self.assertIn("mac-side route", results["matches"][0]["match_text"].lower())
 
         detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
@@ -2496,6 +2617,15 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(ingestion["import_id"], "import_test_truthful")
         self.assertEqual(ingestion["source_session_id"], "session-123")
         self.assertEqual(ingestion["source_conversation_id"], "telegram:713733361")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["audit"]["line_count"], 2)
+        self.assertEqual(manifest["audit"]["entry_type_counts"], {"chat_log": 2})
+        self.assertEqual(manifest["audit"]["author_role_counts"], {"agent": 1, "human": 1})
+        self.assertEqual(manifest["audit"]["source_counts"], {"telegram-direct-import": 2})
+        self.assertEqual(
+            manifest["audit"]["created_at_range"],
+            {"first": "2026-05-25T12:00:00+00:00", "last": "2026-05-25T12:01:00+00:00"},
+        )
 
     def test_import_session_jsonl_rejects_path_like_import_id_before_writes(self) -> None:
         source_file = self.root / "unsafe-import-id.jsonl"
@@ -2544,6 +2674,8 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(second["imported_count"], 0)
         self.assertEqual(second["skipped_count"], 1)
         self.assertEqual(second["skipped"][0]["reason"], "duplicate_source_item")
+        self.assertEqual(second["audit"]["duplicate_source_item_count"], 1)
+        self.assertEqual(second["audit"]["duplicate_existing_entry_ids"], [first["imported"][0]["entry_id"]])
 
     def test_list_entries_filters_by_source_conversation_id(self) -> None:
         source_file_a = self.root / "conversation-a.jsonl"
@@ -4762,6 +4894,8 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(result["items"][1]["import_id"], "import-old")
         self.assertEqual(result["items"][0]["source_session_id"], "session-new")
         self.assertTrue(result["items"][0]["batch_manifest_path"].endswith("import-new.json"))
+        self.assertEqual(result["items"][0]["audit"]["line_count"], 1)
+        self.assertEqual(result["items"][0]["audit"]["source_counts"], {"openclaw-session-import": 1})
 
     def test_list_imports_honors_limit(self) -> None:
         import_session_jsonl(

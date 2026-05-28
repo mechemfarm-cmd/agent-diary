@@ -51,8 +51,24 @@ const scopeConversationIdInput = document.getElementById("scopeConversationId");
 const scopeImportIdInput = document.getElementById("scopeImportId");
 const scopeTruthfulOnlyInput = document.getElementById("scopeTruthfulOnly");
 const clearScopeBtn = document.getElementById("clearScopeBtn");
+const detailSupportStack = document.querySelector(".detail-support-stack");
 let isApplyingUrlState = false;
 let selectedTimelineContext = null;
+
+function wireExclusiveDetails(container) {
+  if (!container) return;
+  const detailsEls = Array.from(container.querySelectorAll("details"));
+  for (const detail of detailsEls) {
+    detail.addEventListener("toggle", () => {
+      if (!detail.open) return;
+      for (const other of detailsEls) {
+        if (other !== detail) {
+          other.open = false;
+        }
+      }
+    });
+  }
+}
 
 const SPEAKER_TONES = [
   {
@@ -659,15 +675,15 @@ async function loadTimeline() {
 }
 
 async function loadImports() {
-  importsStatus.textContent = "Loading import batches...";
+  importsStatus.textContent = "Loading...";
   importsList.setAttribute("aria-busy", "true");
   try {
     const result = await post("/list_imports", { limit: 20 });
     renderImports(result.items || []);
-    importsStatus.textContent = `Showing ${result.count || 0} recent import batch(es). Click one to scope timeline/search.`;
+    importsStatus.textContent = `${result.count || 0} recent`;
   } catch (err) {
     showError(importsList, `Import batches error: ${err.message}`);
-    importsStatus.textContent = "Could not load import batches.";
+    importsStatus.textContent = "Load failed";
   }
 }
 
@@ -1006,6 +1022,7 @@ clearScopeBtn.addEventListener("click", async () => {
 });
 
 async function init() {
+  wireExclusiveDetails(detailSupportStack);
   const hasUrlState = restoreStateFromUrl();
   if (!hasUrlState) {
     restoreState();

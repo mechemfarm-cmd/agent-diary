@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent Diary UI Shell</title>
-    <link rel="stylesheet" href="./styles.css?v=20260527b" />
+    <link rel="stylesheet" href="./styles.css?v=20260527h" />
   </head>
   <body>
     <a class="skip-link" href="#detailBody">Skip to diary entry</a>
@@ -57,13 +57,19 @@
           <div class="panel-actions">
             <button id="prevPageBtn" aria-label="Previous timeline page">Prev</button>
             <button id="nextPageBtn" aria-label="Next timeline page">Next</button>
-            <button id="refreshImportsBtn" aria-label="Refresh import batches">Refresh Imports</button>
           </div>
-          <section class="import-inspector" aria-labelledby="importsHeading">
-            <h3 id="importsHeading">Recent Imports</h3>
-            <p id="importsStatus" class="status-line" role="status" aria-live="polite"></p>
-            <ul id="importsList" class="list import-list" role="list" aria-label="Recent import batches"></ul>
-          </section>
+          <details class="import-inspector" aria-label="Recent import batches">
+            <summary id="importsHeading">
+              <span class="summary-title">Recent Imports</span>
+              <span id="importsStatus" class="summary-status" role="status" aria-live="polite"></span>
+            </summary>
+            <div class="import-inspector-body">
+              <div class="panel-actions compact-actions">
+                <button id="refreshImportsBtn" type="button" aria-label="Refresh import batches">Refresh Imports</button>
+              </div>
+              <ul id="importsList" class="list import-list" role="list" aria-label="Recent import batches"></ul>
+            </div>
+          </details>
           <p id="timelineStatus" class="status-line" role="status" aria-live="polite"></p>
           <ul id="timelineList" class="list scroll-list" role="list" aria-label="Diary timeline entries"></ul>
         </section>
@@ -117,6 +123,6 @@
       </section>
     </main>
 
-    <script type="module" src="./app.js?v=20260527b"></script>
+    <script type="module" src="./app.js?v=20260527h"></script>
   </body>
 </html>

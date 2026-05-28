@@ -25,6 +25,7 @@ from agent_diary.models.types import Artifact, Overlay, RawEntry
 from agent_diary.storage.entry_reader import fetch_raw_entry as fetch_entry_from_files
 from agent_diary.storage.files import append_artifact, append_overlay as append_overlay_file, append_raw_entry
 from agent_diary.storage.imports import (
+    build_import_audit_summary,
     build_source_item_key,
     load_import_batch_manifest,
     list_import_batch_manifests,
@@ -189,6 +190,7 @@ def import_session_jsonl(paths: Paths, payload: dict[str, Any]) -> dict[str, Any
         "skipped_count": len(skipped),
         "imported": imported,
         "skipped": skipped,
+        "audit": build_import_audit_summary(parsed_rows, imported=imported, skipped=skipped),
     }
 
     if not dry_run:
@@ -335,6 +337,7 @@ def list_imports(paths: Paths, payload: dict[str, Any] | None = None) -> dict[st
                 "batch_manifest_path": manifest.get("manifest_path"),
                 "manifest_file": manifest.get("manifest_file"),
                 "dry_run": manifest.get("dry_run"),
+                "audit": manifest.get("audit"),
             }
         )
     return {"limit": limit, "count": len(items), "items": items}
@@ -373,6 +376,26 @@ def _build_preview(text: str, size: int = 140) -> str:
     if len(compact) <= size:
         return compact
     return compact[: size - 3] + "..."
+
+
+def _query_terms(query: str) -> list[str]:
+    return [t for t in re.findall(r"\w+", query.lower()) if t]
+
+
+def _score_match_text(text: str, query: str) -> dict[str, int]:
+    lowered = text.lower()
+    terms = _query_terms(query)
+    if not terms:
+        return {"phrase_bonus": 0, "coverage": 0, "frequency": 0, "score": 0}
+    phrase_bonus = 100 if query.lower() in lowered else 0
+    coverage = sum(1 for term in terms if term in lowered)
+    frequency = sum(lowered.count(term) for term in terms)
+    return {
+        "phrase_bonus": phrase_bonus,
+        "coverage": coverage,
+        "frequency": frequency,
+        "score": phrase_bonus + (coverage * 10) + frequency,
+    }
 
 
 def _normalize_optional_str(value: Any) -> str | None:
@@ -689,21 +712,33 @@ def _build_open_loop_participation(paths: Paths) -> dict[str, dict[str, Any]]:
 
 
 def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, Any]]:
-    terms = [t for t in re.findall(r"\w+", query.lower()) if t]
+    return _search_raw_entries_in_rows(
+        paths,
+        query=query,
+        limit=limit,
+        rows=list_entry_rows(paths.sqlite_path, limit=max(limit * 10, 200), offset=0),
+    )
+
+
+def _search_raw_entries_in_rows(
+    paths: Paths,
+    *,
+    query: str,
+    limit: int,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    terms = _query_terms(query)
     if not terms:
         return []
 
-    candidates = list_entry_rows(paths.sqlite_path, limit=max(limit * 10, 200), offset=0)
     scored: list[dict[str, Any]] = []
-    for row in candidates:
+    for row in rows:
         body = _effective_entry_body_from_row(paths, row)
         content = str(body.get("content", ""))
         lowered = content.lower()
         if not any(term in lowered for term in terms):
             continue
-        phrase_bonus = 100 if query.lower() in lowered else 0
-        coverage = sum(1 for term in terms if term in lowered)
-        frequency = sum(lowered.count(term) for term in terms)
+        score = _score_match_text(content, query)
         scored.append(
             {
                 "entry_id": row["entry_id"],
@@ -714,12 +749,73 @@ def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, 
                 "entry_type": body.get("entry_type", "unknown"),
                 "source": row["source"],
                 "author_role": row["author_role"],
-                "_score": phrase_bonus + (coverage * 10) + frequency,
+                "_score": score["score"],
             }
         )
 
     scored.sort(key=lambda item: (item["_score"], item["indexed_at"]), reverse=True)
     return [{k: v for k, v in item.items() if k != "_score"} for item in scored[:limit]]
+
+
+def _rows_matching_provenance_scope(paths: Paths, filters: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = list_entry_rows(paths.sqlite_path, limit=1000000, offset=0)
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        raw_file = Path(str(row["raw_file_path"]))
+        if not raw_file.exists():
+            continue
+        body = json.loads(raw_file.read_text(encoding="utf-8"))
+        provenance = _resolve_entry_provenance_from_body(body)
+        if _entry_matches_provenance_scope(provenance, filters):
+            matched.append(row)
+    return matched
+
+
+def _search_compressed_entries_in_rows(
+    paths: Paths,
+    *,
+    query: str,
+    limit: int,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    terms = _query_terms(query)
+    if not terms:
+        return []
+
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        entry_id = str(row.get("entry_id", "")).strip()
+        if not entry_id:
+            continue
+        artifact_dir = paths.artifacts_dir / entry_id
+        if not artifact_dir.exists():
+            continue
+        for artifact_file in sorted(artifact_dir.glob("*.json")):
+            artifact = json.loads(artifact_file.read_text(encoding="utf-8"))
+            if not _is_artifact_active(artifact):
+                continue
+            if not _is_compressed_memory_artifact(str(artifact.get("artifact_type", ""))):
+                continue
+            content = str(artifact.get("content", ""))
+            lowered = content.lower()
+            if not any(term in lowered for term in terms):
+                continue
+            score = _score_match_text(content, query)
+            scored.append(
+                {
+                    "entry_id": entry_id,
+                    "artifact_id": str(artifact.get("artifact_id", "")).strip() or artifact.get("artifact_id"),
+                    "indexed_at": str(artifact.get("created_at", "")).strip() or row["created_at"],
+                    "match_text": _build_snippet(content, query),
+                    "match_layer": "compressed_memory",
+                    "supporting_layers": ["compressed_memory"],
+                    "fetch_raw_entry": {"entry_id": entry_id},
+                    "_score": score["score"],
+                }
+            )
+
+    scored.sort(key=lambda item: (item["_score"], item["indexed_at"]), reverse=True)
+    return scored[:limit]
 
 
 def _format_overlay_for_effective_content(overlay: dict[str, Any]) -> str:
@@ -899,6 +995,7 @@ def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query", "")).strip()
     limit = int(payload.get("limit", 20))
     filters = _resolve_provenance_filters(payload)
+    scoped_rows = _rows_matching_provenance_scope(paths, filters) if any(filters.values()) else []
 
     compressed_matches = search_index(paths.sqlite_path, query=query, limit=max(limit * 10, 200))
     linked_matches: list[dict[str, Any]] = []
@@ -921,41 +1018,106 @@ def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
                 "indexed_at": row["indexed_at"],
                 "match_text": _build_snippet(str(row["match_text"]), query),
                 "match_layer": "compressed_memory",
+                "supporting_layers": ["compressed_memory"],
                 "fetch_raw_entry": {"entry_id": row["entry_id"]},
+                "_score": _score_match_text(str(row["match_text"]), query)["score"],
             }
         )
-        if len(linked_matches) >= limit:
+        if len(linked_matches) >= max(limit * 10, 200):
             break
-    fallback_matches: list[dict[str, Any]] = []
-    if not linked_matches:
-        raw_hits = _search_raw_entries(paths, query=query, limit=max(limit * 10, 200))
-        for row in raw_hits:
-            entry_id = str(row["entry_id"])
-            entry_row = get_entry_row(paths.sqlite_path, entry_id)
-            if entry_row is None:
+    if scoped_rows:
+        scoped_entry_ids = {str(row.get("entry_id", "")).strip() for row in scoped_rows if str(row.get("entry_id", "")).strip()}
+        seen_pairs = {
+            (str(match.get("entry_id", "")).strip(), str(match.get("artifact_id", "")).strip())
+            for match in linked_matches
+        }
+        for match in _search_compressed_entries_in_rows(paths, query=query, limit=max(limit * 10, 200), rows=scoped_rows):
+            pair = (str(match.get("entry_id", "")).strip(), str(match.get("artifact_id", "")).strip())
+            if str(match.get("entry_id", "")).strip() not in scoped_entry_ids:
                 continue
-            raw_file = Path(str(entry_row["raw_file_path"]))
-            if not raw_file.exists():
+            if pair in seen_pairs:
                 continue
-            body = json.loads(raw_file.read_text(encoding="utf-8"))
-            provenance = _resolve_entry_provenance_from_body(body)
-            if not _entry_matches_provenance_scope(provenance, filters):
-                continue
-            fallback_matches.append(
-                {
-                    "entry_id": row["entry_id"],
-                    "artifact_id": row["artifact_id"],
-                    "indexed_at": row["indexed_at"],
-                    "match_text": _build_snippet(str(row["match_text"]), query),
-                    "match_layer": row["match_layer"],
-                    "entry_type": row["entry_type"],
-                    "source": row["source"],
-                    "author_role": row["author_role"],
-                    "fetch_raw_entry": {"entry_id": row["entry_id"]},
-                }
-            )
-            if len(fallback_matches) >= limit:
-                break
+            linked_matches.append(match)
+            seen_pairs.add(pair)
+    raw_matches: list[dict[str, Any]] = []
+    raw_hits = (
+        _search_raw_entries_in_rows(paths, query=query, limit=max(limit * 10, 200), rows=scoped_rows)
+        if scoped_rows
+        else _search_raw_entries(paths, query=query, limit=max(limit * 10, 200))
+    )
+    for row in raw_hits:
+        entry_id = str(row["entry_id"])
+        entry_row = get_entry_row(paths.sqlite_path, entry_id)
+        if entry_row is None:
+            continue
+        raw_file = Path(str(entry_row["raw_file_path"]))
+        if not raw_file.exists():
+            continue
+        body = json.loads(raw_file.read_text(encoding="utf-8"))
+        provenance = _resolve_entry_provenance_from_body(body)
+        if not _entry_matches_provenance_scope(provenance, filters):
+            continue
+        raw_matches.append(
+            {
+                "entry_id": row["entry_id"],
+                "artifact_id": row["artifact_id"],
+                "indexed_at": row["indexed_at"],
+                "match_text": _build_snippet(str(row["match_text"]), query),
+                "match_layer": row["match_layer"],
+                "supporting_layers": ["raw_entry"],
+                "entry_type": row["entry_type"],
+                "source": row["source"],
+                "author_role": row["author_role"],
+                "fetch_raw_entry": {"entry_id": row["entry_id"]},
+                "_score": _score_match_text(str(row["match_text"]), query)["score"] + 2,
+            }
+        )
+        if len(raw_matches) >= max(limit * 10, 200):
+            break
+
+    combined_by_entry: dict[str, dict[str, Any]] = {}
+    compressed_count = 0
+    raw_count = 0
+    for match in linked_matches + raw_matches:
+        entry_id = str(match["entry_id"])
+        existing = combined_by_entry.get(entry_id)
+        if "compressed_memory" in match.get("supporting_layers", []):
+            compressed_count += 1
+        if "raw_entry" in match.get("supporting_layers", []):
+            raw_count += 1
+        if existing is None:
+            combined_by_entry[entry_id] = dict(match)
+            continue
+
+        merged_layers = sorted({*existing.get("supporting_layers", []), *match.get("supporting_layers", [])})
+        replacement = dict(existing)
+        prefer_match = False
+        if int(match.get("_score", 0)) > int(existing.get("_score", 0)):
+            prefer_match = True
+        elif int(match.get("_score", 0)) == int(existing.get("_score", 0)) and match.get("match_layer") != "compressed_memory":
+            prefer_match = True
+
+        if prefer_match:
+            replacement = dict(match)
+            for carry_key in ("entry_type", "source", "author_role"):
+                if carry_key not in replacement and carry_key in existing:
+                    replacement[carry_key] = existing[carry_key]
+        else:
+            for carry_key in ("entry_type", "source", "author_role"):
+                if carry_key in match and carry_key not in replacement:
+                    replacement[carry_key] = match[carry_key]
+        replacement["supporting_layers"] = merged_layers
+        combined_by_entry[entry_id] = replacement
+
+    ranked_matches = sorted(
+        combined_by_entry.values(),
+        key=lambda item: (int(item.get("_score", 0)), str(item.get("indexed_at", ""))),
+        reverse=True,
+    )
+    matches = [
+        {k: v for k, v in item.items() if k != "_score"}
+        for item in ranked_matches[:limit]
+    ]
     return {
         "query": query,
         "limit": limit,
@@ -965,13 +1127,14 @@ def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "import_id": filters.get("import_id"),
             "truthful_only": bool(filters.get("truthful_only", False)),
         },
-        "matches": linked_matches or fallback_matches,
+        "matches": matches,
         "match_summary": {
-            "compressed_memory_hits": len(linked_matches),
-            "raw_entry_fallback_hits": len(fallback_matches),
-            "using_fallback": not linked_matches and bool(fallback_matches),
+            "compressed_memory_hits": compressed_count,
+            "raw_entry_hits": raw_count,
+            "entry_matches": len(matches),
+            "using_raw_layer": bool(raw_count),
         },
-        "note": "Search prefers compressed-memory artifacts and falls back to raw-entry text when the compressed layer has no hits.",
+        "note": "Search merges derived compressed-memory hits with authoritative raw-entry matches and ranks them per entry.",
     }
 
 
@@ -1169,11 +1332,39 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         selected = latest_by_type.get(artifact_type)
         artifact["is_current"] = key == selected if selected is not None else True
 
+    artifact_types = sorted(
+        {
+            str(artifact.get("artifact_type", "")).strip()
+            for artifact in artifacts
+            if str(artifact.get("artifact_type", "")).strip()
+        }
+    )
+    current_by_type: dict[str, dict[str, Any]] = {}
+    for artifact in artifacts:
+        artifact_type = str(artifact.get("artifact_type", "")).strip()
+        if not artifact_type or not artifact.get("is_current"):
+            continue
+        current_by_type[artifact_type] = {
+            "artifact_id": artifact.get("artifact_id"),
+            "created_at": artifact.get("created_at"),
+            "producer": artifact.get("producer"),
+            "overlay_stale": bool(artifact.get("overlay_stale", False)),
+            "lifecycle_status": artifact.get("lifecycle_status"),
+        }
+
     return {
         "entry_id": entry["entry_id"],
         "raw_entry": entry,
+        "entry_provenance": _resolve_entry_provenance_from_body(entry),
         "overlays": overlays,
         "artifacts": artifacts,
+        "artifact_summary": {
+            "total_count": len(artifacts),
+            "current_count": sum(1 for artifact in artifacts if artifact.get("is_current")),
+            "stale_count": sum(1 for artifact in artifacts if artifact.get("overlay_stale")),
+            "artifact_types": artifact_types,
+            "current_by_type": current_by_type,
+        },
         "truth_model": {
             "primary": "raw_entry",
             "secondary": "artifacts",
