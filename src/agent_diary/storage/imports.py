@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -134,3 +135,56 @@ def load_import_batch_manifest(paths: Paths, import_id: str) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise ValueError(f"import batch manifest is malformed: {normalized}")
     return body
+
+
+def build_import_audit_summary(
+    parsed_rows: list[dict[str, Any]],
+    *,
+    imported: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> dict[str, Any]:
+    entry_type_counts = Counter()
+    source_counts = Counter()
+    author_role_counts = Counter()
+    created_at_values: list[str] = []
+    for row in parsed_rows:
+        entry = row.get("entry", {})
+        if not isinstance(entry, dict):
+            continue
+        entry_type_counts[str(entry.get("entry_type", "")).strip() or "unknown"] += 1
+        source_counts[str(entry.get("source", "")).strip() or "unknown"] += 1
+        author_role_counts[str(entry.get("author_role", "")).strip() or "unknown"] += 1
+        created_at = str(entry.get("created_at", "")).strip()
+        if created_at:
+            created_at_values.append(created_at)
+
+    duplicate_entry_ids = sorted(
+        {
+            str(item.get("existing_entry_id", "")).strip()
+            for item in skipped
+            if isinstance(item, dict) and str(item.get("existing_entry_id", "")).strip()
+        }
+    )
+    imported_entry_ids = [
+        str(item.get("entry_id", "")).strip()
+        for item in imported
+        if isinstance(item, dict) and str(item.get("entry_id", "")).strip()
+    ]
+
+    return {
+        "line_count": len(parsed_rows),
+        "entry_type_counts": dict(sorted(entry_type_counts.items())),
+        "source_counts": dict(sorted(source_counts.items())),
+        "author_role_counts": dict(sorted(author_role_counts.items())),
+        "created_at_range": {
+            "first": min(created_at_values) if created_at_values else None,
+            "last": max(created_at_values) if created_at_values else None,
+        },
+        "imported_entry_ids": imported_entry_ids,
+        "duplicate_existing_entry_ids": duplicate_entry_ids,
+        "duplicate_source_item_count": sum(
+            1
+            for item in skipped
+            if isinstance(item, dict) and str(item.get("reason", "")).strip() == "duplicate_source_item"
+        ),
+    }

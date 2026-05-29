@@ -9,6 +9,7 @@ class Paths:
     root: Path
     data_root: Path
     entries_dir: Path
+    work_trace_dir: Path
     overlays_dir: Path
     artifacts_dir: Path
     imports_dir: Path
@@ -24,6 +25,7 @@ def default_paths(root: Path | None = None) -> Paths:
         root=project_root,
         data_root=data_root,
         entries_dir=data_root / "entries",
+        work_trace_dir=data_root / "work_trace",
         overlays_dir=data_root / "overlays",
         artifacts_dir=data_root / "artifacts",
         imports_dir=data_root / "imports",

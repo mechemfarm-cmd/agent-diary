@@ -14,6 +14,20 @@ CREATE TABLE IF NOT EXISTS entries (
   raw_file_path TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS work_trace_events (
+  event_id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  project TEXT,
+  source_surface TEXT,
+  actor TEXT,
+  session_key TEXT,
+  task_id TEXT,
+  searchable_text TEXT NOT NULL,
+  work_file_path TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
   artifact_id TEXT PRIMARY KEY,
   entry_id TEXT NOT NULL,

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent Diary UI Shell</title>
-    <link rel="stylesheet" href="./styles.css?v=20260527b" />
+    <link rel="stylesheet" href="./styles.css?v=20260529a" />
   </head>
   <body>
     <a class="skip-link" href="#detailBody">Skip to diary entry</a>
@@ -29,6 +29,7 @@
 
     <main class="layout" role="main">
       <aside class="nav-column" aria-label="Search and timeline navigation">
+        <div id="scopeBar" class="scope-bar" aria-live="polite" aria-label="Active browse scope"></div>
         <section class="panel panel-search" aria-labelledby="searchHeading">
           <h2 id="searchHeading">Search</h2>
           <form id="searchForm" class="search-form" role="search" aria-label="Search memory">
@@ -57,13 +58,19 @@
           <div class="panel-actions">
             <button id="prevPageBtn" aria-label="Previous timeline page">Prev</button>
             <button id="nextPageBtn" aria-label="Next timeline page">Next</button>
-            <button id="refreshImportsBtn" aria-label="Refresh import batches">Refresh Imports</button>
           </div>
-          <section class="import-inspector" aria-labelledby="importsHeading">
-            <h3 id="importsHeading">Recent Imports</h3>
-            <p id="importsStatus" class="status-line" role="status" aria-live="polite"></p>
-            <ul id="importsList" class="list import-list" role="list" aria-label="Recent import batches"></ul>
-          </section>
+          <details class="import-inspector" aria-label="Recent import batches">
+            <summary id="importsHeading">
+              <span class="summary-title">Recent Imports</span>
+              <span id="importsStatus" class="summary-status" role="status" aria-live="polite"></span>
+            </summary>
+            <div class="import-inspector-body">
+              <div class="panel-actions compact-actions">
+                <button id="refreshImportsBtn" type="button" aria-label="Refresh import batches" title="Refresh import batches">↻</button>
+              </div>
+              <ul id="importsList" class="list import-list" role="list" aria-label="Recent import batches"></ul>
+            </div>
+          </details>
           <p id="timelineStatus" class="status-line" role="status" aria-live="polite"></p>
           <ul id="timelineList" class="list scroll-list" role="list" aria-label="Diary timeline entries"></ul>
         </section>
@@ -72,8 +79,18 @@
       <section class="panel panel-detail" aria-labelledby="detailHeading">
         <h2 id="detailHeading">Diary Entry</h2>
         <p id="detailStatus" class="status-line" role="status" aria-live="polite"></p>
+        <div id="recallBanner" class="recall-banner" hidden aria-label="Memory recall origin" aria-live="polite"></div>
         <div id="detailMeta" class="meta" aria-label="Entry metadata"></div>
         <article id="detailBody" class="raw-body" tabindex="-1">Select an entry to view raw detail.</article>
+        <div id="artifactStatusBar" class="artifact-status-bar" aria-label="Artifact status" aria-live="polite"></div>
+      </section>
+
+      <aside class="panel panel-interpretation" role="complementary" aria-label="Derived interpretation and annotations">
+        <div id="interpHeader" class="interp-header"></div>
+        <details id="loopDetails" aria-label="Open loop analysis">
+          <summary>Open Loops</summary>
+          <ul id="loopList" class="list secondary layer-list" role="list" aria-label="Open loop analysis items"></ul>
+        </details>
         <div class="detail-support-stack" aria-label="Supporting interpretation layers">
           <details id="briefDetails" aria-label="Conversation brief layer">
             <summary>Conversation Brief</summary>
@@ -102,6 +119,7 @@
           </details>
           <details id="refreshDerivedDetails" aria-label="Refresh derived layers">
             <summary>Refresh Derived Layers</summary>
+            <p id="refreshDerivedScope" class="status-line compact-status" role="status" aria-live="polite"></p>
             <div class="refresh-derived-actions">
               <button id="refreshOpenLoopsBtn" type="button">Refresh Open Loops</button>
               <button id="refreshBriefsBtn" type="button">Refresh Conversation Briefs</button>
@@ -114,9 +132,9 @@
             <ul id="artifactList" class="list secondary layer-list" role="list" aria-label="Entry artifacts"></ul>
           </details>
         </div>
-      </section>
+      </aside>
     </main>
 
-    <script type="module" src="./app.js?v=20260527b"></script>
+    <script type="module" src="./app.js?v=20260529a"></script>
   </body>
 </html>

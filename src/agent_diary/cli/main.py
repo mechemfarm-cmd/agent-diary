@@ -12,25 +12,34 @@ from agent_diary.cli.openclaw_session_import import (
     import_openclaw_session,
     import_telegram_direct,
 )
+from agent_diary.cli.openclaw_work_trace_import import (
+    backfill_openclaw_work_trace_session_key,
+    import_openclaw_work_trace,
+)
 from agent_diary.cli.transcript_adapter import SUPPORTED_ADAPTER_FORMATS, adapt_session_export, build_openclaw_telegram_direct_transcript
 from agent_diary.config import default_paths
 from agent_diary.index.sqlite_index import bootstrap_sqlite
 from agent_diary.service.handlers import (
     append_entry,
     append_overlay,
+    append_work_trace_event,
     attach_artifact,
     fetch_entry_detail,
     fetch_raw_entry,
+    fetch_work_trace_event,
     import_session_and_refresh_derived,
     import_session_jsonl,
     list_entries,
     list_imports,
+    list_work_trace,
     produce_conversation_briefs,
     produce_compressed_memory,
     produce_open_loops,
     normalize_derived_artifact_lifecycle,
     refresh_derived_for_import,
+    search_all,
     search_memory,
+    search_work_trace,
 )
 from agent_diary.service.http_server import run_server
 from agent_diary.storage.files import ensure_data_dirs
@@ -61,6 +70,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_append.add_argument("--title")
     p_append.add_argument("--metadata", default="{}")
 
+    p_work_trace = sub.add_parser("append-work-trace")
+    p_work_trace.add_argument("--event-type", required=True)
+    p_work_trace.add_argument("--summary", required=True)
+    p_work_trace.add_argument("--created-at")
+    p_work_trace.add_argument("--project")
+    p_work_trace.add_argument("--source-surface")
+    p_work_trace.add_argument("--actor")
+    p_work_trace.add_argument("--session-key")
+    p_work_trace.add_argument("--task-id")
+    p_work_trace.add_argument("--details", default="{}")
+    p_work_trace.add_argument("--related-entry-ids", default="[]")
+    p_work_trace.add_argument("--related-artifact-ids", default="[]")
+    p_work_trace.add_argument("--related-paths", default="[]")
+    p_work_trace.add_argument("--tags", default="[]")
+
     p_artifact = sub.add_parser("attach-artifact")
     p_artifact.add_argument("--entry-id", required=True)
     p_artifact.add_argument("--artifact-type", required=True)
@@ -86,10 +110,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--import-id", help="optional provenance filter")
     p_search.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
 
+    p_search_work_trace = sub.add_parser("search-work-trace")
+    p_search_work_trace.add_argument("--query", required=True)
+    p_search_work_trace.add_argument("--limit", type=int, default=20)
+    p_search_work_trace.add_argument("--event-type")
+    p_search_work_trace.add_argument("--project")
+
+    p_search_all = sub.add_parser("search-all")
+    p_search_all.add_argument("--query", required=True)
+    p_search_all.add_argument("--limit", type=int, default=20)
+    p_search_all.add_argument("--filters", default="{}")
+    p_search_all.add_argument("--source-conversation-id", help="optional provenance filter")
+    p_search_all.add_argument("--source-session-id", help="optional provenance filter")
+    p_search_all.add_argument("--import-id", help="optional provenance filter")
+    p_search_all.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
+    p_search_all.add_argument("--event-type")
+    p_search_all.add_argument("--project")
+
     p_fetch = sub.add_parser("fetch-raw-entry")
     p_fetch.add_argument("--entry-id", required=True)
     p_fetch.add_argument("--include-overlays", action="store_true")
     p_fetch.add_argument("--include-artifacts", action="store_true")
+
+    p_fetch_work_trace = sub.add_parser("fetch-work-trace")
+    p_fetch_work_trace.add_argument("--event-id", required=True)
 
     p_list = sub.add_parser("list-entries")
     p_list.add_argument("--limit", type=int, default=20)
@@ -99,6 +143,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--import-id", help="optional provenance filter")
     p_list.add_argument("--truthful-only", action="store_true", help="include only truthful imported entries")
     p_list.add_argument("--filters", default="{}", help="optional JSON object merged with explicit provenance filters")
+
+    p_list_work_trace = sub.add_parser("list-work-trace")
+    p_list_work_trace.add_argument("--limit", type=int, default=20)
+    p_list_work_trace.add_argument("--offset", type=int, default=0)
+    p_list_work_trace.add_argument("--event-type")
+    p_list_work_trace.add_argument("--project")
 
     p_detail = sub.add_parser("fetch-entry-detail")
     p_detail.add_argument("--entry-id", required=True)
@@ -212,6 +262,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_telegram_direct_import.add_argument("--min-messages-before-gap-split", type=int, default=4, help="avoid splitting on a time gap when the current chunk is still smaller than this many messages")
     p_telegram_direct_import.add_argument("--min-chars-before-gap-split", type=int, default=400, help="avoid splitting on a time gap when the current chunk is still smaller than this many rendered characters")
 
+    p_openclaw_work_trace = sub.add_parser(
+        "import-openclaw-work-trace",
+        help="import searchable work trace from one OpenClaw session file",
+        description="Extract command/action/test evidence from an OpenClaw session JSONL file and store it as work-trace events.",
+    )
+    p_openclaw_work_trace.add_argument("--input-path", required=True, help="OpenClaw session JSONL file")
+    p_openclaw_work_trace.add_argument("--session-key", help="optional session key to stamp onto imported work-trace events")
+    p_openclaw_work_trace.add_argument("--dry-run", action="store_true", help="discover work-trace events without writing them")
+
     p_backfill = sub.add_parser(
         "backfill-openclaw-session-key",
         help="import many OpenClaw session files discovered from trajectory metadata for one session key",
@@ -229,6 +288,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_backfill.add_argument("--max-messages", type=int, default=80, help="split session chunks when they exceed this many messages")
     p_backfill.add_argument("--min-messages-before-gap-split", type=int, default=4, help="avoid splitting on a time gap when the current chunk is still smaller than this many messages")
     p_backfill.add_argument("--min-chars-before-gap-split", type=int, default=400, help="avoid splitting on a time gap when the current chunk is still smaller than this many rendered characters")
+
+    p_backfill_work_trace = sub.add_parser(
+        "backfill-openclaw-work-trace-session-key",
+        help="import work trace from many OpenClaw session files discovered from trajectory metadata",
+        description="Find session files for a session key under the trajectory store and import command/action/test evidence into work trace.",
+    )
+    p_backfill_work_trace.add_argument("--session-key", required=True, help="OpenClaw session key to backfill")
+    p_backfill_work_trace.add_argument("--trajectories-root", default="~/.openclaw/agents/main/sessions", help="directory containing *.trajectory.jsonl files")
+    p_backfill_work_trace.add_argument("--since", help="inclusive lower bound for trajectory start time; accepts YYYY-MM-DD or ISO timestamp")
+    p_backfill_work_trace.add_argument("--until", help="exclusive upper bound for trajectory start time; accepts YYYY-MM-DD or ISO timestamp")
+    p_backfill_work_trace.add_argument("--days-back", type=int, help="convenience window counting backward from now when --since is omitted")
+    p_backfill_work_trace.add_argument("--dry-run", action="store_true", help="discover and plan the backfill without writing work-trace events")
 
     p_backfill_telegram = sub.add_parser(
         "backfill-telegram-direct",
@@ -320,6 +391,73 @@ def main() -> None:
             merged["truthful_only"] = True
         return merged
 
+    def _collect_str_values(obj: Any, keys: set[str]) -> list[str]:
+        found: list[str] = []
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in keys and isinstance(value, str) and value.strip():
+                    found.append(value.strip())
+                else:
+                    found.extend(_collect_str_values(value, keys))
+        elif isinstance(obj, list):
+            for item in obj:
+                found.extend(_collect_str_values(item, keys))
+        return found
+
+    def _collect_list_values(obj: Any, keys: set[str]) -> list[str]:
+        found: list[str] = []
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in keys and isinstance(value, list):
+                    found.extend([str(item).strip() for item in value if str(item).strip()])
+                else:
+                    found.extend(_collect_list_values(value, keys))
+        elif isinstance(obj, list):
+            for item in obj:
+                found.extend(_collect_list_values(item, keys))
+        return found
+
+    def _record_cli_command(command_name: str, result: dict[str, Any]) -> None:
+        related_paths = sorted(
+            {
+                *[value for value in _collect_str_values(result, {"raw_file", "overlay_file", "artifact_file", "manifest_path", "ledger_path", "batch_manifest_path", "work_file", "work_file_path"}) if value],
+            }
+        )
+        related_entry_ids = sorted(
+            {
+                *[value for value in _collect_str_values(result, {"entry_id"}) if value],
+                *[value for value in _collect_list_values(result, {"imported_entry_ids", "source_entry_ids"}) if value],
+            }
+        )
+        related_artifact_ids = sorted({*[
+            value for value in _collect_str_values(result, {"artifact_id"}) if value
+        ]})
+        summary_map = {
+            "append-entry": "Ran append-entry command.",
+            "append-overlay": "Ran append-overlay command.",
+            "attach-artifact": "Ran attach-artifact command.",
+            "import-session-jsonl": "Ran import-session-jsonl command.",
+            "import-session-and-analyze": "Ran import-session-and-analyze command.",
+            "refresh-derived-for-import": "Ran refresh-derived-for-import command.",
+            "produce-open-loops": "Ran produce-open-loops command.",
+            "produce-conversation-briefs": "Ran produce-conversation-briefs command.",
+            "produce-compressed-memory": "Ran produce-compressed-memory command.",
+        }
+        append_work_trace_event(
+            paths,
+            {
+                "event_type": "command",
+                "summary": summary_map.get(command_name, f"Ran {command_name} command."),
+                "project": "agent-diary",
+                "source_surface": "cli",
+                "details": {"command": command_name},
+                "related_entry_ids": related_entry_ids,
+                "related_artifact_ids": related_artifact_ids,
+                "related_paths": related_paths,
+                "tags": ["auto", "command", command_name],
+            },
+        )
+
     paths = default_paths()
     ensure_data_dirs(paths)
     bootstrap_sqlite(paths.sqlite_path)
@@ -336,6 +474,28 @@ def main() -> None:
         if args.title:
             payload["title"] = args.title
         out = append_entry(paths, payload)
+        _record_cli_command(args.command, out)
+        _print(out, args.json)
+        return
+
+    if args.command == "append-work-trace":
+        payload = {
+            "event_type": args.event_type,
+            "summary": args.summary,
+            "project": args.project,
+            "source_surface": args.source_surface,
+            "actor": args.actor,
+            "session_key": args.session_key,
+            "task_id": args.task_id,
+            "details": json.loads(args.details),
+            "related_entry_ids": json.loads(args.related_entry_ids),
+            "related_artifact_ids": json.loads(args.related_artifact_ids),
+            "related_paths": json.loads(args.related_paths),
+            "tags": json.loads(args.tags),
+        }
+        if args.created_at:
+            payload["created_at"] = args.created_at
+        out = append_work_trace_event(paths, payload)
         _print(out, args.json)
         return
 
@@ -350,6 +510,7 @@ def main() -> None:
         if args.created_at:
             payload["created_at"] = args.created_at
         out = attach_artifact(paths, payload)
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -364,6 +525,7 @@ def main() -> None:
         if args.created_at:
             payload["created_at"] = args.created_at
         out = append_overlay(paths, payload)
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -377,6 +539,33 @@ def main() -> None:
         _print(out, args.json)
         return
 
+    if args.command == "search-work-trace":
+        out = search_work_trace(
+            paths,
+            {
+                "query": args.query,
+                "limit": args.limit,
+                "event_type": args.event_type,
+                "project": args.project,
+            },
+        )
+        _print(out, args.json)
+        return
+
+    if args.command == "search-all":
+        out = search_all(
+            paths,
+            {
+                "query": args.query,
+                "limit": args.limit,
+                "filters": _merge_scope_filters(args.filters, args),
+                "event_type": args.event_type,
+                "project": args.project,
+            },
+        )
+        _print(out, args.json)
+        return
+
     if args.command == "fetch-raw-entry":
         payload = {
             "entry_id": args.entry_id,
@@ -387,9 +576,27 @@ def main() -> None:
         _print(out, args.json)
         return
 
+    if args.command == "fetch-work-trace":
+        out = fetch_work_trace_event(paths, {"event_id": args.event_id})
+        _print(out, args.json)
+        return
+
     if args.command == "list-entries":
         merged_filters = _merge_scope_filters(args.filters, args)
         out = list_entries(paths, {"limit": args.limit, "offset": args.offset, "filters": merged_filters})
+        _print(out, args.json)
+        return
+
+    if args.command == "list-work-trace":
+        out = list_work_trace(
+            paths,
+            {
+                "limit": args.limit,
+                "offset": args.offset,
+                "event_type": args.event_type,
+                "project": args.project,
+            },
+        )
         _print(out, args.json)
         return
 
@@ -407,6 +614,7 @@ def main() -> None:
                 "filters": _merge_scope_filters(args.filters, args),
             },
         )
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -416,6 +624,7 @@ def main() -> None:
             paths,
             {"limit": args.limit, "entry_ids": args.entry_ids, "force": args.force, "filters": merged_filters},
         )
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -425,6 +634,7 @@ def main() -> None:
             paths,
             {"limit": args.limit, "entry_ids": args.entry_ids, "force": args.force, "filters": merged_filters},
         )
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -462,6 +672,7 @@ def main() -> None:
                 "dry_run": args.dry_run,
             },
         )
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -476,6 +687,7 @@ def main() -> None:
                 "dry_run": args.dry_run,
             },
         )
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -488,6 +700,7 @@ def main() -> None:
                 "force": not args.no_force,
             },
         )
+        _record_cli_command(args.command, out)
         _print(out, args.json)
         return
 
@@ -559,6 +772,16 @@ def main() -> None:
         _print(out, args.json)
         return
 
+    if args.command == "import-openclaw-work-trace":
+        out = import_openclaw_work_trace(
+            paths,
+            input_path=Path(args.input_path).expanduser().resolve(),
+            session_key=args.session_key,
+            dry_run=args.dry_run,
+        )
+        _print(out, args.json)
+        return
+
     if args.command == "import-telegram-direct":
         out = import_telegram_direct(
             paths,
@@ -594,6 +817,19 @@ def main() -> None:
             max_messages=args.max_messages,
             min_messages_before_gap_split=args.min_messages_before_gap_split,
             min_chars_before_gap_split=args.min_chars_before_gap_split,
+        )
+        _print(out, args.json)
+        return
+
+    if args.command == "backfill-openclaw-work-trace-session-key":
+        out = backfill_openclaw_work_trace_session_key(
+            paths,
+            trajectories_root=Path(args.trajectories_root).expanduser().resolve(),
+            session_key=args.session_key,
+            since=args.since,
+            until=args.until,
+            days_back=args.days_back,
+            dry_run=args.dry_run,
         )
         _print(out, args.json)
         return

@@ -15,16 +15,26 @@ from agent_diary.analytics.open_loops import build_open_loops_payload
 from agent_diary.config import Paths
 from agent_diary.index.repository import (
     get_entry_row,
+    get_work_trace_row,
     insert_artifact,
     insert_entry,
     insert_memory_index_row,
+    insert_work_trace_event,
     list_entry_rows,
+    list_work_trace_rows,
     search_memory as search_index,
+    search_work_trace as search_work_trace_index,
 )
-from agent_diary.models.types import Artifact, Overlay, RawEntry
+from agent_diary.models.types import Artifact, Overlay, RawEntry, WorkTraceEvent
 from agent_diary.storage.entry_reader import fetch_raw_entry as fetch_entry_from_files
-from agent_diary.storage.files import append_artifact, append_overlay as append_overlay_file, append_raw_entry
+from agent_diary.storage.files import (
+    append_artifact,
+    append_overlay as append_overlay_file,
+    append_raw_entry,
+    append_work_trace_event as append_work_trace_event_file,
+)
 from agent_diary.storage.imports import (
+    build_import_audit_summary,
     build_source_item_key,
     load_import_batch_manifest,
     list_import_batch_manifests,
@@ -49,7 +59,302 @@ def append_entry(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     entry = RawEntry(**payload)
     raw_path = append_raw_entry(paths, entry)
     insert_entry(paths.sqlite_path, entry, str(raw_path))
-    return {"entry_id": entry.entry_id, "raw_file": str(raw_path)}
+    result = {"entry_id": entry.entry_id, "raw_file": str(raw_path)}
+    _append_work_trace_best_effort(
+        paths,
+        {
+            "event_type": "file_change",
+            "summary": f"Appended raw entry {entry.entry_id}.",
+            "project": "agent-diary",
+            "source_surface": "agent-diary",
+            "details": {
+                "change_kind": "create",
+                "entry_type": entry.entry_type,
+                "source": entry.source,
+                "author_role": entry.author_role,
+            },
+            "related_entry_ids": [entry.entry_id],
+            "related_paths": [str(raw_path)],
+            "tags": ["auto", "file_change", "raw_entry"],
+        },
+    )
+    return result
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list")
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _append_work_trace_best_effort(paths: Paths, payload: dict[str, Any]) -> None:
+    # Work-trace capture is secondary and should not block the primary operation.
+    try:
+        append_work_trace_event(paths, payload)
+    except Exception:
+        return
+
+
+def append_work_trace_event(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    _require_fields(payload, ["event_type", "summary"])
+    details = payload.get("details", {})
+    if details in (None, ""):
+        details = {}
+    if not isinstance(details, dict):
+        raise ValueError("details must be an object")
+
+    event_payload = {
+        "event_type": str(payload["event_type"]).strip(),
+        "summary": str(payload["summary"]).strip(),
+        "details": details,
+        "project": _normalize_optional_text(payload.get("project")),
+        "source_surface": _normalize_optional_text(payload.get("source_surface")),
+        "actor": _normalize_optional_text(payload.get("actor")),
+        "session_key": _normalize_optional_text(payload.get("session_key")),
+        "task_id": _normalize_optional_text(payload.get("task_id")),
+        "related_entry_ids": _normalize_string_list(payload.get("related_entry_ids"), field_name="related_entry_ids"),
+        "related_artifact_ids": _normalize_string_list(payload.get("related_artifact_ids"), field_name="related_artifact_ids"),
+        "related_paths": _normalize_string_list(payload.get("related_paths"), field_name="related_paths"),
+        "tags": _normalize_string_list(payload.get("tags"), field_name="tags"),
+    }
+    event_id = _normalize_optional_text(payload.get("event_id"))
+    if event_id:
+        event_payload["event_id"] = event_id
+    created_at = _normalize_optional_text(payload.get("created_at"))
+    if created_at:
+        event_payload["created_at"] = created_at
+
+    event = WorkTraceEvent(**event_payload)
+    event_path = append_work_trace_event_file(paths, event)
+    insert_work_trace_event(paths.sqlite_path, event, str(event_path))
+    return {"event_id": event.event_id, "work_file": str(event_path)}
+
+
+def fetch_work_trace_event(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    _require_fields(payload, ["event_id"])
+    event_id = str(payload["event_id"]).strip()
+    row = get_work_trace_row(paths.sqlite_path, event_id)
+    if row is None:
+        raise FileNotFoundError(f"work trace event not found: {event_id}")
+    work_file = Path(str(row["work_file_path"]))
+    if not work_file.exists():
+        raise FileNotFoundError(f"work trace file missing: {work_file}")
+    body = json.loads(work_file.read_text(encoding="utf-8"))
+    return {"event": body}
+
+
+def list_work_trace(paths: Paths, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    limit = int(payload.get("limit", 20))
+    offset = int(payload.get("offset", 0))
+    event_type = _normalize_optional_text(payload.get("event_type"))
+    project = _normalize_optional_text(payload.get("project"))
+    rows = list_work_trace_rows(
+        paths.sqlite_path,
+        limit=limit,
+        offset=offset,
+        event_type=event_type,
+        project=project,
+    )
+    items = [
+        {
+            "event_id": row["event_id"],
+            "created_at": row["created_at"],
+            "event_type": row["event_type"],
+            "summary": row["summary"],
+            "project": row.get("project"),
+            "source_surface": row.get("source_surface"),
+            "actor": row.get("actor"),
+            "session_key": row.get("session_key"),
+            "task_id": row.get("task_id"),
+            "work_file_path": row.get("work_file_path"),
+        }
+        for row in rows
+    ]
+    return {
+        "limit": limit,
+        "offset": offset,
+        "filters": {"event_type": event_type, "project": project},
+        "count": len(items),
+        "items": items,
+    }
+
+
+def _build_work_trace_snippet(text: str, query: str, size: int = 160) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= size:
+        return compact
+    terms = [t for t in re.findall(r"\w+", query.lower()) if t]
+    lowered = compact.lower()
+    pivot = -1
+    for term in terms:
+        idx = lowered.find(term)
+        if idx != -1 and (pivot == -1 or idx < pivot):
+            pivot = idx
+    if pivot == -1:
+        return compact[: size - 3] + "..."
+    start = max(0, pivot - (size // 3))
+    end = min(len(compact), start + size)
+    snippet = compact[start:end]
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(compact):
+        snippet = snippet + "..."
+    return snippet
+
+
+def search_work_trace(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    query = str(payload.get("query", "")).strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = int(payload.get("limit", 20))
+    event_type = _normalize_optional_text(payload.get("event_type"))
+    project = _normalize_optional_text(payload.get("project"))
+    matches = search_work_trace_index(
+        paths.sqlite_path,
+        query=query,
+        limit=limit,
+        event_type=event_type,
+        project=project,
+    )
+    items = [
+        {
+            "event_id": row["event_id"],
+            "created_at": row["created_at"],
+            "event_type": row["event_type"],
+            "summary": row["summary"],
+            "project": row.get("project"),
+            "source_surface": row.get("source_surface"),
+            "actor": row.get("actor"),
+            "session_key": row.get("session_key"),
+            "task_id": row.get("task_id"),
+            "match_text": _build_work_trace_snippet(
+                " ".join(
+                    part
+                    for part in [str(row.get("summary", "")), str(row.get("project", "")), str(row.get("work_file_path", ""))]
+                    if part and part != "None"
+                ),
+                query,
+            ),
+            "fetch_work_trace": {"event_id": row["event_id"]},
+        }
+        for row in matches
+    ]
+    return {
+        "query": query,
+        "limit": limit,
+        "filters": {"event_type": event_type, "project": project},
+        "count": len(items),
+        "matches": items,
+    }
+
+
+def _entry_search_context(paths: Paths, entry_id: str) -> dict[str, Any]:
+    row = get_entry_row(paths.sqlite_path, entry_id)
+    if row is None:
+        return {}
+    raw_file = Path(str(row["raw_file_path"]))
+    if not raw_file.exists():
+        return {}
+    body = json.loads(raw_file.read_text(encoding="utf-8"))
+    return {
+        "created_at": body.get("created_at"),
+        "entry_type": body.get("entry_type"),
+        "source": body.get("source"),
+        "author_role": body.get("author_role"),
+        "title": body.get("title"),
+    }
+
+
+def search_all(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
+    query = str(payload.get("query", "")).strip()
+    if not query:
+        raise ValueError("query is required")
+    limit = int(payload.get("limit", 20))
+
+    memory_result = search_memory(paths, payload)
+    work_trace_result = search_work_trace(
+        paths,
+        {
+            "query": query,
+            "limit": limit,
+            "event_type": payload.get("event_type"),
+            "project": payload.get("project"),
+        },
+    )
+
+    combined: list[dict[str, Any]] = []
+
+    for match in memory_result.get("matches", []):
+        entry_id = str(match.get("entry_id", "")).strip()
+        context = _entry_search_context(paths, entry_id) if entry_id else {}
+        combined.append(
+            {
+                "search_domain": "conversation",
+                "created_at": context.get("created_at"),
+                "entry_id": entry_id or None,
+                "entry_type": context.get("entry_type") or match.get("entry_type"),
+                "source": context.get("source") or match.get("source"),
+                "author_role": context.get("author_role") or match.get("author_role"),
+                "title": context.get("title"),
+                "match_layer": match.get("match_layer"),
+                "supporting_layers": match.get("supporting_layers", []),
+                "match_text": match.get("match_text"),
+                "fetch_raw_entry": match.get("fetch_raw_entry"),
+            }
+        )
+
+    for match in work_trace_result.get("matches", []):
+        combined.append(
+            {
+                "search_domain": "work_trace",
+                "created_at": match.get("created_at"),
+                "event_id": match.get("event_id"),
+                "event_type": match.get("event_type"),
+                "summary": match.get("summary"),
+                "project": match.get("project"),
+                "source_surface": match.get("source_surface"),
+                "actor": match.get("actor"),
+                "session_key": match.get("session_key"),
+                "task_id": match.get("task_id"),
+                "match_text": match.get("match_text"),
+                "fetch_work_trace": match.get("fetch_work_trace"),
+            }
+        )
+
+    combined.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    combined = combined[:limit]
+
+    return {
+        "query": query,
+        "limit": limit,
+        "filters": {
+            "source_conversation_id": memory_result.get("filters", {}).get("source_conversation_id"),
+            "source_session_id": memory_result.get("filters", {}).get("source_session_id"),
+            "import_id": memory_result.get("filters", {}).get("import_id"),
+            "truthful_only": memory_result.get("filters", {}).get("truthful_only", False),
+            "event_type": work_trace_result.get("filters", {}).get("event_type"),
+            "project": work_trace_result.get("filters", {}).get("project"),
+        },
+        "counts": {
+            "conversation_matches": len(memory_result.get("matches", [])),
+            "work_trace_matches": len(work_trace_result.get("matches", [])),
+            "combined_matches": len(combined),
+            "compressed_memory_hits": memory_result.get("match_summary", {}).get("compressed_memory_hits", 0),
+            "raw_entry_hits": memory_result.get("match_summary", {}).get("raw_entry_hits", 0),
+        },
+        "matches": combined,
+        "note": "Combined search spans authoritative conversation truth, derived memory artifacts, and recorded work-trace activity.",
+    }
 
 
 def append_overlay(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -62,12 +367,30 @@ def append_overlay(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
 
     overlay = Overlay(**payload)
     overlay_path = append_overlay_file(paths, overlay)
-    return {
+    result = {
         "entry_id": overlay.entry_id,
         "overlay_id": overlay.overlay_id,
         "overlay_file": str(overlay_path),
         "overlay_type": overlay.overlay_type,
     }
+    _append_work_trace_best_effort(
+        paths,
+        {
+            "event_type": "file_change",
+            "summary": f"Appended {overlay.overlay_type} overlay for entry {overlay.entry_id}.",
+            "project": "agent-diary",
+            "source_surface": "agent-diary",
+            "details": {
+                "change_kind": "create",
+                "overlay_type": overlay.overlay_type,
+                "author": overlay.author,
+            },
+            "related_entry_ids": [overlay.entry_id],
+            "related_paths": [str(overlay_path)],
+            "tags": ["auto", "file_change", "overlay"],
+        },
+    )
+    return result
 
 
 def _utc_now_iso() -> str:
@@ -189,6 +512,7 @@ def import_session_jsonl(paths: Paths, payload: dict[str, Any]) -> dict[str, Any
         "skipped_count": len(skipped),
         "imported": imported,
         "skipped": skipped,
+        "audit": build_import_audit_summary(parsed_rows, imported=imported, skipped=skipped),
     }
 
     if not dry_run:
@@ -196,6 +520,35 @@ def import_session_jsonl(paths: Paths, payload: dict[str, Any]) -> dict[str, Any
         manifest["ledger_path"] = str(ledger_path)
     manifest_path = write_import_batch_manifest(paths, import_id=import_id, manifest=manifest)
     manifest["manifest_path"] = str(manifest_path)
+    _append_work_trace_best_effort(
+        paths,
+        {
+            "event_type": "action",
+            "summary": f"Imported session JSONL batch {import_id}.",
+            "project": "agent-diary",
+            "source_surface": "agent-diary",
+            "details": {
+                "import_mode": "session_jsonl",
+                "import_id": import_id,
+                "dry_run": dry_run,
+                "imported_count": len(imported),
+                "skipped_count": len(skipped),
+                "source_session_id": source_session_id,
+                "source_conversation_id": source_conversation_id,
+            },
+            "related_entry_ids": [
+                str(item.get("entry_id", "")).strip()
+                for item in imported
+                if isinstance(item, dict) and str(item.get("entry_id", "")).strip()
+            ],
+            "related_paths": [
+                str(import_path),
+                str(manifest_path),
+                str(manifest.get("ledger_path", "")) if manifest.get("ledger_path") else "",
+            ],
+            "tags": ["auto", "action", "import"],
+        },
+    )
     return manifest
 
 
@@ -242,7 +595,7 @@ def import_session_and_refresh_derived(paths: Paths, payload: dict[str, Any]) ->
             },
         }
 
-    return {
+    result = {
         "import_id": import_result.get("import_id"),
         "imported_count": int(import_result.get("imported_count", 0)),
         "skipped_count": int(import_result.get("skipped_count", 0)),
@@ -250,6 +603,24 @@ def import_session_and_refresh_derived(paths: Paths, payload: dict[str, Any]) ->
         "import_result": import_result,
         "derived": derived,
     }
+    _append_work_trace_best_effort(
+        paths,
+        {
+            "event_type": "action",
+            "summary": f"Imported session batch and refreshed derived layers for {result['import_id']}.",
+            "project": "agent-diary",
+            "source_surface": "agent-diary",
+            "details": {
+                "import_id": result["import_id"],
+                "imported_count": result["imported_count"],
+                "skipped_count": result["skipped_count"],
+                "derived": derived,
+            },
+            "related_entry_ids": imported_entry_ids,
+            "tags": ["auto", "action", "import", "derived_refresh"],
+        },
+    )
+    return result
 
 
 def refresh_derived_for_import(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -303,7 +674,7 @@ def refresh_derived_for_import(paths: Paths, payload: dict[str, Any]) -> dict[st
             },
         }
 
-    return {
+    result = {
         "import_id": import_id,
         "imported_entry_count": len(imported_entry_ids),
         "imported_entry_ids": imported_entry_ids,
@@ -312,6 +683,26 @@ def refresh_derived_for_import(paths: Paths, payload: dict[str, Any]) -> dict[st
         "dry_run": dry_run,
         "derived": derived,
     }
+    _append_work_trace_best_effort(
+        paths,
+        {
+            "event_type": "action",
+            "summary": f"Refreshed derived layers for import {import_id}.",
+            "project": "agent-diary",
+            "source_surface": "agent-diary",
+            "details": {
+                "import_id": import_id,
+                "dry_run": dry_run,
+                "force": force,
+                "imported_entry_count": len(imported_entry_ids),
+                "derived": derived,
+            },
+            "related_entry_ids": imported_entry_ids,
+            "related_paths": [str(paths.imports_dir / "batches" / f"{import_id}.json")],
+            "tags": ["auto", "action", "derived_refresh"],
+        },
+    )
+    return result
 
 
 def list_imports(paths: Paths, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -335,6 +726,7 @@ def list_imports(paths: Paths, payload: dict[str, Any] | None = None) -> dict[st
                 "batch_manifest_path": manifest.get("manifest_path"),
                 "manifest_file": manifest.get("manifest_file"),
                 "dry_run": manifest.get("dry_run"),
+                "audit": manifest.get("audit"),
             }
         )
     return {"limit": limit, "count": len(items), "items": items}
@@ -373,6 +765,26 @@ def _build_preview(text: str, size: int = 140) -> str:
     if len(compact) <= size:
         return compact
     return compact[: size - 3] + "..."
+
+
+def _query_terms(query: str) -> list[str]:
+    return [t for t in re.findall(r"\w+", query.lower()) if t]
+
+
+def _score_match_text(text: str, query: str) -> dict[str, int]:
+    lowered = text.lower()
+    terms = _query_terms(query)
+    if not terms:
+        return {"phrase_bonus": 0, "coverage": 0, "frequency": 0, "score": 0}
+    phrase_bonus = 100 if query.lower() in lowered else 0
+    coverage = sum(1 for term in terms if term in lowered)
+    frequency = sum(lowered.count(term) for term in terms)
+    return {
+        "phrase_bonus": phrase_bonus,
+        "coverage": coverage,
+        "frequency": frequency,
+        "score": phrase_bonus + (coverage * 10) + frequency,
+    }
 
 
 def _normalize_optional_str(value: Any) -> str | None:
@@ -689,21 +1101,33 @@ def _build_open_loop_participation(paths: Paths) -> dict[str, dict[str, Any]]:
 
 
 def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, Any]]:
-    terms = [t for t in re.findall(r"\w+", query.lower()) if t]
+    return _search_raw_entries_in_rows(
+        paths,
+        query=query,
+        limit=limit,
+        rows=list_entry_rows(paths.sqlite_path, limit=max(limit * 10, 200), offset=0),
+    )
+
+
+def _search_raw_entries_in_rows(
+    paths: Paths,
+    *,
+    query: str,
+    limit: int,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    terms = _query_terms(query)
     if not terms:
         return []
 
-    candidates = list_entry_rows(paths.sqlite_path, limit=max(limit * 10, 200), offset=0)
     scored: list[dict[str, Any]] = []
-    for row in candidates:
+    for row in rows:
         body = _effective_entry_body_from_row(paths, row)
         content = str(body.get("content", ""))
         lowered = content.lower()
         if not any(term in lowered for term in terms):
             continue
-        phrase_bonus = 100 if query.lower() in lowered else 0
-        coverage = sum(1 for term in terms if term in lowered)
-        frequency = sum(lowered.count(term) for term in terms)
+        score = _score_match_text(content, query)
         scored.append(
             {
                 "entry_id": row["entry_id"],
@@ -714,12 +1138,73 @@ def _search_raw_entries(paths: Paths, query: str, limit: int) -> list[dict[str, 
                 "entry_type": body.get("entry_type", "unknown"),
                 "source": row["source"],
                 "author_role": row["author_role"],
-                "_score": phrase_bonus + (coverage * 10) + frequency,
+                "_score": score["score"],
             }
         )
 
     scored.sort(key=lambda item: (item["_score"], item["indexed_at"]), reverse=True)
     return [{k: v for k, v in item.items() if k != "_score"} for item in scored[:limit]]
+
+
+def _rows_matching_provenance_scope(paths: Paths, filters: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = list_entry_rows(paths.sqlite_path, limit=1000000, offset=0)
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        raw_file = Path(str(row["raw_file_path"]))
+        if not raw_file.exists():
+            continue
+        body = json.loads(raw_file.read_text(encoding="utf-8"))
+        provenance = _resolve_entry_provenance_from_body(body)
+        if _entry_matches_provenance_scope(provenance, filters):
+            matched.append(row)
+    return matched
+
+
+def _search_compressed_entries_in_rows(
+    paths: Paths,
+    *,
+    query: str,
+    limit: int,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    terms = _query_terms(query)
+    if not terms:
+        return []
+
+    scored: list[dict[str, Any]] = []
+    for row in rows:
+        entry_id = str(row.get("entry_id", "")).strip()
+        if not entry_id:
+            continue
+        artifact_dir = paths.artifacts_dir / entry_id
+        if not artifact_dir.exists():
+            continue
+        for artifact_file in sorted(artifact_dir.glob("*.json")):
+            artifact = json.loads(artifact_file.read_text(encoding="utf-8"))
+            if not _is_artifact_active(artifact):
+                continue
+            if not _is_compressed_memory_artifact(str(artifact.get("artifact_type", ""))):
+                continue
+            content = str(artifact.get("content", ""))
+            lowered = content.lower()
+            if not any(term in lowered for term in terms):
+                continue
+            score = _score_match_text(content, query)
+            scored.append(
+                {
+                    "entry_id": entry_id,
+                    "artifact_id": str(artifact.get("artifact_id", "")).strip() or artifact.get("artifact_id"),
+                    "indexed_at": str(artifact.get("created_at", "")).strip() or row["created_at"],
+                    "match_text": _build_snippet(content, query),
+                    "match_layer": "compressed_memory",
+                    "supporting_layers": ["compressed_memory"],
+                    "fetch_raw_entry": {"entry_id": entry_id},
+                    "_score": score["score"],
+                }
+            )
+
+    scored.sort(key=lambda item: (item["_score"], item["indexed_at"]), reverse=True)
+    return scored[:limit]
 
 
 def _format_overlay_for_effective_content(overlay: dict[str, Any]) -> str:
@@ -888,17 +1373,38 @@ def attach_artifact(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             memory_text=artifact.content,
         )
         indexed = True
-    return {
+    result = {
         "artifact_id": artifact.artifact_id,
         "artifact_file": str(artifact_path),
         "indexed_in_memory": indexed,
     }
+    _append_work_trace_best_effort(
+        paths,
+        {
+            "event_type": "file_change",
+            "summary": f"Attached {artifact.artifact_type} artifact to entry {artifact.entry_id}.",
+            "project": "agent-diary",
+            "source_surface": "agent-diary",
+            "details": {
+                "change_kind": "create",
+                "artifact_type": artifact.artifact_type,
+                "producer": artifact.producer,
+                "indexed_in_memory": indexed,
+            },
+            "related_entry_ids": [artifact.entry_id],
+            "related_artifact_ids": [artifact.artifact_id],
+            "related_paths": [str(artifact_path)],
+            "tags": ["auto", "file_change", "artifact", artifact.artifact_type],
+        },
+    )
+    return result
 
 
 def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query", "")).strip()
     limit = int(payload.get("limit", 20))
     filters = _resolve_provenance_filters(payload)
+    scoped_rows = _rows_matching_provenance_scope(paths, filters) if any(filters.values()) else []
 
     compressed_matches = search_index(paths.sqlite_path, query=query, limit=max(limit * 10, 200))
     linked_matches: list[dict[str, Any]] = []
@@ -921,41 +1427,106 @@ def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
                 "indexed_at": row["indexed_at"],
                 "match_text": _build_snippet(str(row["match_text"]), query),
                 "match_layer": "compressed_memory",
+                "supporting_layers": ["compressed_memory"],
                 "fetch_raw_entry": {"entry_id": row["entry_id"]},
+                "_score": _score_match_text(str(row["match_text"]), query)["score"],
             }
         )
-        if len(linked_matches) >= limit:
+        if len(linked_matches) >= max(limit * 10, 200):
             break
-    fallback_matches: list[dict[str, Any]] = []
-    if not linked_matches:
-        raw_hits = _search_raw_entries(paths, query=query, limit=max(limit * 10, 200))
-        for row in raw_hits:
-            entry_id = str(row["entry_id"])
-            entry_row = get_entry_row(paths.sqlite_path, entry_id)
-            if entry_row is None:
+    if scoped_rows:
+        scoped_entry_ids = {str(row.get("entry_id", "")).strip() for row in scoped_rows if str(row.get("entry_id", "")).strip()}
+        seen_pairs = {
+            (str(match.get("entry_id", "")).strip(), str(match.get("artifact_id", "")).strip())
+            for match in linked_matches
+        }
+        for match in _search_compressed_entries_in_rows(paths, query=query, limit=max(limit * 10, 200), rows=scoped_rows):
+            pair = (str(match.get("entry_id", "")).strip(), str(match.get("artifact_id", "")).strip())
+            if str(match.get("entry_id", "")).strip() not in scoped_entry_ids:
                 continue
-            raw_file = Path(str(entry_row["raw_file_path"]))
-            if not raw_file.exists():
+            if pair in seen_pairs:
                 continue
-            body = json.loads(raw_file.read_text(encoding="utf-8"))
-            provenance = _resolve_entry_provenance_from_body(body)
-            if not _entry_matches_provenance_scope(provenance, filters):
-                continue
-            fallback_matches.append(
-                {
-                    "entry_id": row["entry_id"],
-                    "artifact_id": row["artifact_id"],
-                    "indexed_at": row["indexed_at"],
-                    "match_text": _build_snippet(str(row["match_text"]), query),
-                    "match_layer": row["match_layer"],
-                    "entry_type": row["entry_type"],
-                    "source": row["source"],
-                    "author_role": row["author_role"],
-                    "fetch_raw_entry": {"entry_id": row["entry_id"]},
-                }
-            )
-            if len(fallback_matches) >= limit:
-                break
+            linked_matches.append(match)
+            seen_pairs.add(pair)
+    raw_matches: list[dict[str, Any]] = []
+    raw_hits = (
+        _search_raw_entries_in_rows(paths, query=query, limit=max(limit * 10, 200), rows=scoped_rows)
+        if scoped_rows
+        else _search_raw_entries(paths, query=query, limit=max(limit * 10, 200))
+    )
+    for row in raw_hits:
+        entry_id = str(row["entry_id"])
+        entry_row = get_entry_row(paths.sqlite_path, entry_id)
+        if entry_row is None:
+            continue
+        raw_file = Path(str(entry_row["raw_file_path"]))
+        if not raw_file.exists():
+            continue
+        body = json.loads(raw_file.read_text(encoding="utf-8"))
+        provenance = _resolve_entry_provenance_from_body(body)
+        if not _entry_matches_provenance_scope(provenance, filters):
+            continue
+        raw_matches.append(
+            {
+                "entry_id": row["entry_id"],
+                "artifact_id": row["artifact_id"],
+                "indexed_at": row["indexed_at"],
+                "match_text": _build_snippet(str(row["match_text"]), query),
+                "match_layer": row["match_layer"],
+                "supporting_layers": ["raw_entry"],
+                "entry_type": row["entry_type"],
+                "source": row["source"],
+                "author_role": row["author_role"],
+                "fetch_raw_entry": {"entry_id": row["entry_id"]},
+                "_score": _score_match_text(str(row["match_text"]), query)["score"] + 2,
+            }
+        )
+        if len(raw_matches) >= max(limit * 10, 200):
+            break
+
+    combined_by_entry: dict[str, dict[str, Any]] = {}
+    compressed_count = 0
+    raw_count = 0
+    for match in linked_matches + raw_matches:
+        entry_id = str(match["entry_id"])
+        existing = combined_by_entry.get(entry_id)
+        if "compressed_memory" in match.get("supporting_layers", []):
+            compressed_count += 1
+        if "raw_entry" in match.get("supporting_layers", []):
+            raw_count += 1
+        if existing is None:
+            combined_by_entry[entry_id] = dict(match)
+            continue
+
+        merged_layers = sorted({*existing.get("supporting_layers", []), *match.get("supporting_layers", [])})
+        replacement = dict(existing)
+        prefer_match = False
+        if int(match.get("_score", 0)) > int(existing.get("_score", 0)):
+            prefer_match = True
+        elif int(match.get("_score", 0)) == int(existing.get("_score", 0)) and match.get("match_layer") != "compressed_memory":
+            prefer_match = True
+
+        if prefer_match:
+            replacement = dict(match)
+            for carry_key in ("entry_type", "source", "author_role"):
+                if carry_key not in replacement and carry_key in existing:
+                    replacement[carry_key] = existing[carry_key]
+        else:
+            for carry_key in ("entry_type", "source", "author_role"):
+                if carry_key in match and carry_key not in replacement:
+                    replacement[carry_key] = match[carry_key]
+        replacement["supporting_layers"] = merged_layers
+        combined_by_entry[entry_id] = replacement
+
+    ranked_matches = sorted(
+        combined_by_entry.values(),
+        key=lambda item: (int(item.get("_score", 0)), str(item.get("indexed_at", ""))),
+        reverse=True,
+    )
+    matches = [
+        {k: v for k, v in item.items() if k != "_score"}
+        for item in ranked_matches[:limit]
+    ]
     return {
         "query": query,
         "limit": limit,
@@ -965,13 +1536,14 @@ def search_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "import_id": filters.get("import_id"),
             "truthful_only": bool(filters.get("truthful_only", False)),
         },
-        "matches": linked_matches or fallback_matches,
+        "matches": matches,
         "match_summary": {
-            "compressed_memory_hits": len(linked_matches),
-            "raw_entry_fallback_hits": len(fallback_matches),
-            "using_fallback": not linked_matches and bool(fallback_matches),
+            "compressed_memory_hits": compressed_count,
+            "raw_entry_hits": raw_count,
+            "entry_matches": len(matches),
+            "using_raw_layer": bool(raw_count),
         },
-        "note": "Search prefers compressed-memory artifacts and falls back to raw-entry text when the compressed layer has no hits.",
+        "note": "Search merges derived compressed-memory hits with authoritative raw-entry matches and ranks them per entry.",
     }
 
 
@@ -1169,11 +1741,39 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         selected = latest_by_type.get(artifact_type)
         artifact["is_current"] = key == selected if selected is not None else True
 
+    artifact_types = sorted(
+        {
+            str(artifact.get("artifact_type", "")).strip()
+            for artifact in artifacts
+            if str(artifact.get("artifact_type", "")).strip()
+        }
+    )
+    current_by_type: dict[str, dict[str, Any]] = {}
+    for artifact in artifacts:
+        artifact_type = str(artifact.get("artifact_type", "")).strip()
+        if not artifact_type or not artifact.get("is_current"):
+            continue
+        current_by_type[artifact_type] = {
+            "artifact_id": artifact.get("artifact_id"),
+            "created_at": artifact.get("created_at"),
+            "producer": artifact.get("producer"),
+            "overlay_stale": bool(artifact.get("overlay_stale", False)),
+            "lifecycle_status": artifact.get("lifecycle_status"),
+        }
+
     return {
         "entry_id": entry["entry_id"],
         "raw_entry": entry,
+        "entry_provenance": _resolve_entry_provenance_from_body(entry),
         "overlays": overlays,
         "artifacts": artifacts,
+        "artifact_summary": {
+            "total_count": len(artifacts),
+            "current_count": sum(1 for artifact in artifacts if artifact.get("is_current")),
+            "stale_count": sum(1 for artifact in artifacts if artifact.get("overlay_stale")),
+            "artifact_types": artifact_types,
+            "current_by_type": current_by_type,
+        },
         "truth_model": {
             "primary": "raw_entry",
             "secondary": "artifacts",
@@ -1269,7 +1869,7 @@ def produce_open_loops(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         },
     }
     attached = attach_artifact(paths, artifact_payload)
-    return {
+    result = {
         "artifact_id": attached["artifact_id"],
         "artifact_file": attached["artifact_file"],
         "loop_count": len(payload_content["loops"]),
@@ -1277,6 +1877,26 @@ def produce_open_loops(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         "selection_mode": selection["selection_mode"],
         "filters": selection["filters"],
     }
+    _append_work_trace_best_effort(
+        paths,
+        {
+            "event_type": "action",
+            "summary": f"Produced open-loop analysis for {len(source_entry_ids)} source entries.",
+            "project": "agent-diary",
+            "source_surface": "agent-diary",
+            "details": {
+                "artifact_id": result["artifact_id"],
+                "loop_count": result["loop_count"],
+                "selection_mode": result["selection_mode"],
+                "filters": result["filters"],
+            },
+            "related_entry_ids": source_entry_ids,
+            "related_artifact_ids": [result["artifact_id"]],
+            "related_paths": [result["artifact_file"]],
+            "tags": ["auto", "action", "producer", "open_loops"],
+        },
+    )
+    return result
 
 
 def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1321,7 +1941,7 @@ def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[s
                 "brief": brief,
             }
         )
-    return {
+    result = {
         "produced_count": len(produced),
         "skipped_count": len(skipped),
         "produced": produced,
@@ -1329,6 +1949,27 @@ def produce_conversation_briefs(paths: Paths, payload: dict[str, Any]) -> dict[s
         "selection_mode": selection["selection_mode"],
         "filters": selection["filters"],
     }
+    if produced or skipped:
+        _append_work_trace_best_effort(
+            paths,
+            {
+                "event_type": "action",
+                "summary": f"Produced conversation briefs for {len(produced)} entries and skipped {len(skipped)}.",
+                "project": "agent-diary",
+                "source_surface": "agent-diary",
+                "details": {
+                    "produced_count": len(produced),
+                    "skipped_count": len(skipped),
+                    "selection_mode": selection["selection_mode"],
+                    "filters": selection["filters"],
+                },
+                "related_entry_ids": [str(item["entry_id"]) for item in produced] + skipped,
+                "related_artifact_ids": [str(item["artifact_id"]) for item in produced],
+                "related_paths": [str(item["artifact_file"]) for item in produced],
+                "tags": ["auto", "action", "producer", "conversation_brief"],
+            },
+        )
+    return result
 
 
 def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1373,7 +2014,7 @@ def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str
                 "indexed_in_memory": attached["indexed_in_memory"],
             }
         )
-    return {
+    result = {
         "produced_count": len(produced),
         "skipped_count": len(skipped),
         "produced": produced,
@@ -1381,6 +2022,27 @@ def produce_compressed_memory(paths: Paths, payload: dict[str, Any]) -> dict[str
         "selection_mode": selection["selection_mode"],
         "filters": selection["filters"],
     }
+    if produced or skipped:
+        _append_work_trace_best_effort(
+            paths,
+            {
+                "event_type": "action",
+                "summary": f"Produced compressed memory for {len(produced)} entries and skipped {len(skipped)}.",
+                "project": "agent-diary",
+                "source_surface": "agent-diary",
+                "details": {
+                    "produced_count": len(produced),
+                    "skipped_count": len(skipped),
+                    "selection_mode": selection["selection_mode"],
+                    "filters": selection["filters"],
+                },
+                "related_entry_ids": [str(item["entry_id"]) for item in produced] + skipped,
+                "related_artifact_ids": [str(item["artifact_id"]) for item in produced],
+                "related_paths": [str(item["artifact_file"]) for item in produced],
+                "tags": ["auto", "action", "producer", "compressed_memory"],
+            },
+        )
+    return result
 
 
 def status(paths: Paths) -> dict[str, Any]:

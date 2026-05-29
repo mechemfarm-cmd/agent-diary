@@ -14,14 +14,19 @@ RouteFn = Callable[[Paths, dict[str, Any]], dict[str, Any]]
 class AgentDiaryHandler(BaseHTTPRequestHandler):
     routes: dict[str, RouteFn] = {
         "/append_entry": handlers.append_entry,
+        "/append_work_trace": handlers.append_work_trace_event,
         "/append_overlay": handlers.append_overlay,
         "/attach_artifact": handlers.attach_artifact,
         "/produce_open_loops": handlers.produce_open_loops,
         "/produce_conversation_briefs": handlers.produce_conversation_briefs,
         "/produce_compressed_memory": handlers.produce_compressed_memory,
         "/search_memory": handlers.search_memory,
+        "/search_all": handlers.search_all,
+        "/search_work_trace": handlers.search_work_trace,
         "/list_imports": handlers.list_imports,
+        "/fetch_work_trace": handlers.fetch_work_trace_event,
         "/fetch_raw_entry": handlers.fetch_raw_entry,
+        "/list_work_trace": handlers.list_work_trace,
         "/list_entries": handlers.list_entries,
         "/fetch_entry_detail": handlers.fetch_entry_detail,
     }

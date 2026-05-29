@@ -5,13 +5,14 @@ from datetime import datetime
 from pathlib import Path
 
 from agent_diary.config import Paths
-from agent_diary.models.types import Artifact, Overlay, RawEntry
+from agent_diary.models.types import Artifact, Overlay, RawEntry, WorkTraceEvent
 from agent_diary.storage.imports import ensure_import_dirs
 
 
 def ensure_data_dirs(paths: Paths) -> None:
     for p in (
         paths.entries_dir,
+        paths.work_trace_dir,
         paths.overlays_dir,
         paths.artifacts_dir,
         paths.imports_dir,
@@ -33,6 +34,14 @@ def append_raw_entry(paths: Paths, entry: RawEntry) -> Path:
     # Append-only intent: write once and fail if the path already exists.
     with target.open("x", encoding="utf-8") as f:
         f.write(json.dumps(entry.to_dict(), indent=2))
+    return target
+
+
+def append_work_trace_event(paths: Paths, event: WorkTraceEvent) -> Path:
+    target = _entry_path(paths.work_trace_dir, event.event_id, event.created_at)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("x", encoding="utf-8") as f:
+        f.write(json.dumps(event.to_dict(), indent=2))
     return target
 
 

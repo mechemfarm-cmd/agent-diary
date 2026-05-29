@@ -29,6 +29,27 @@ class RawEntry:
 
 
 @dataclass
+class WorkTraceEvent:
+    event_type: str
+    summary: str
+    created_at: str = field(default_factory=now_iso)
+    project: str | None = None
+    source_surface: str | None = None
+    actor: str | None = None
+    session_key: str | None = None
+    task_id: str | None = None
+    details: Metadata = field(default_factory=dict)
+    related_entry_ids: list[str] = field(default_factory=list)
+    related_artifact_ids: list[str] = field(default_factory=list)
+    related_paths: list[str] = field(default_factory=list)
+    tags: list[str] = field(default_factory=list)
+    event_id: str = field(default_factory=lambda: f"work_{uuid4().hex}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class Artifact:
     """Secondary interpreted data linked to authoritative raw entries.
 

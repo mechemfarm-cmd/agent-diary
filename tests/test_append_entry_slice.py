@@ -11,6 +11,11 @@ from datetime import datetime
 from pathlib import Path
 
 from agent_diary.cli.openclaw_session_import import backfill_openclaw_session_key, discover_openclaw_session_files
+from agent_diary.cli.openclaw_work_trace_import import (
+    backfill_openclaw_work_trace_session_key,
+    extract_openclaw_work_trace_events,
+    import_openclaw_work_trace,
+)
 from agent_diary.analytics.conversation_briefs import build_conversation_brief_text
 from agent_diary.analytics.compressed_memory import build_compressed_memory_text
 from agent_diary.cli.session_builder import TranscriptMessage, build_session_entries, build_session_jsonl
@@ -20,19 +25,24 @@ from agent_diary.index.sqlite_index import bootstrap_sqlite
 from agent_diary.service.handlers import (
     append_entry,
     append_overlay,
+    append_work_trace_event,
     attach_artifact,
     fetch_entry_detail,
     fetch_raw_entry,
+    fetch_work_trace_event,
     import_session_and_refresh_derived,
     import_session_jsonl,
     list_entries,
     list_imports,
+    list_work_trace,
     normalize_derived_artifact_lifecycle,
     produce_conversation_briefs,
     produce_compressed_memory,
     produce_open_loops,
     refresh_derived_for_import,
+    search_all,
     search_memory,
+    search_work_trace,
     status,
 )
 from agent_diary.service.http_server import AgentDiaryHandler
@@ -98,6 +108,283 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(row[2], "openclaw")
         self.assertEqual(row[3], "agent")
         self.assertEqual(row[4], result["raw_file"])
+
+    def test_append_work_trace_writes_file_and_index_row(self) -> None:
+        result = append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "command",
+                "summary": "Ran append-entry slice tests.",
+                "created_at": "2026-05-29T08:00:00+00:00",
+                "project": "agent-diary",
+                "source_surface": "telegram-direct",
+                "actor": "tom",
+                "details": {"command": "python3 -m unittest tests.test_append_entry_slice -v", "result": "pass"},
+                "related_paths": ["tests/test_append_entry_slice.py"],
+                "tags": ["verification"],
+            },
+        )
+
+        work_file = Path(result["work_file"])
+        self.assertTrue(work_file.exists())
+        body = json.loads(work_file.read_text(encoding="utf-8"))
+        self.assertEqual(body["event_id"], result["event_id"])
+        self.assertEqual(body["event_type"], "command")
+        self.assertEqual(body["details"]["result"], "pass")
+
+        with sqlite3.connect(self.paths.sqlite_path) as conn:
+            row = conn.execute(
+                "SELECT event_id, created_at, event_type, summary, project, work_file_path FROM work_trace_events WHERE event_id = ?",
+                (result["event_id"],),
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row[0], result["event_id"])
+        self.assertEqual(row[1], "2026-05-29T08:00:00+00:00")
+        self.assertEqual(row[2], "command")
+        self.assertEqual(row[3], "Ran append-entry slice tests.")
+        self.assertEqual(row[4], "agent-diary")
+        self.assertEqual(row[5], result["work_file"])
+
+    def test_append_entry_auto_records_file_change_work_trace(self) -> None:
+        result = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "auto trace me",
+                "created_at": "2026-05-29T10:00:00+00:00",
+            },
+        )
+
+        listed = list_work_trace(self.paths, {"limit": 10, "offset": 0})
+        self.assertGreaterEqual(len(listed["items"]), 1)
+        first = listed["items"][0]
+        self.assertEqual(first["event_type"], "file_change")
+        fetched = fetch_work_trace_event(self.paths, {"event_id": first["event_id"]})
+        self.assertEqual(fetched["event"]["related_entry_ids"], [result["entry_id"]])
+        self.assertEqual(fetched["event"]["details"]["change_kind"], "create")
+
+    def test_fetch_work_trace_returns_authoritative_record(self) -> None:
+        created = append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "decision",
+                "summary": "Deferred UI work-trace integration.",
+                "details": {"reason": "backend first"},
+            },
+        )
+
+        fetched = fetch_work_trace_event(self.paths, {"event_id": created["event_id"]})
+        self.assertEqual(fetched["event"]["event_id"], created["event_id"])
+        self.assertEqual(fetched["event"]["event_type"], "decision")
+        self.assertEqual(fetched["event"]["details"]["reason"], "backend first")
+
+    def test_list_work_trace_orders_newest_first(self) -> None:
+        older = append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "decision",
+                "summary": "Older decision",
+                "created_at": "2026-05-29T07:00:00+00:00",
+                "project": "agent-diary",
+            },
+        )
+        newer = append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "command",
+                "summary": "Newer command",
+                "created_at": "2026-05-29T09:00:00+00:00",
+                "project": "agent-diary",
+            },
+        )
+
+        listed = list_work_trace(self.paths, {"limit": 10, "offset": 0, "project": "agent-diary"})
+        self.assertEqual([item["event_id"] for item in listed["items"][:2]], [newer["event_id"], older["event_id"]])
+
+    def test_search_work_trace_finds_summary_and_path(self) -> None:
+        append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "file_change",
+                "summary": "Adjusted timeline layout sizing.",
+                "project": "agent-diary",
+                "related_paths": ["ui/styles.css"],
+                "details": {"change": "rebalanced nav column rows"},
+            },
+        )
+        append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "command",
+                "summary": "Ran unrelated command",
+                "project": "other-project",
+            },
+        )
+
+        by_summary = search_work_trace(self.paths, {"query": "timeline layout", "limit": 5})
+        self.assertEqual(by_summary["matches"][0]["event_type"], "file_change")
+
+        by_project = search_work_trace(self.paths, {"query": "styles", "limit": 5, "project": "agent-diary"})
+        self.assertEqual(len(by_project["matches"]), 1)
+        self.assertEqual(by_project["matches"][0]["project"], "agent-diary")
+
+    def test_search_all_combines_conversation_and_work_trace_results(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_message",
+                "source": "telegram",
+                "author_role": "human",
+                "content": "We should verify the friday deploy before release.",
+                "created_at": "2026-05-29T10:00:00+00:00",
+            },
+        )
+        append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "test_run",
+                "summary": "Ran friday deploy verification suite.",
+                "project": "agent-diary",
+                "source_surface": "openclaw-session",
+                "created_at": "2026-05-29T10:05:00+00:00",
+            },
+        )
+
+        results = search_all(self.paths, {"query": "friday deploy", "limit": 10})
+
+        self.assertEqual(results["counts"]["conversation_matches"], 1)
+        self.assertEqual(results["counts"]["work_trace_matches"], 1)
+        self.assertEqual(results["counts"]["combined_matches"], 2)
+        domains = [item["search_domain"] for item in results["matches"]]
+        self.assertIn("conversation", domains)
+        self.assertIn("work_trace", domains)
+        conversation = next(item for item in results["matches"] if item["search_domain"] == "conversation")
+        self.assertEqual(conversation["entry_id"], entry["entry_id"])
+        self.assertIn("fetch_raw_entry", conversation)
+        work_trace = next(item for item in results["matches"] if item["search_domain"] == "work_trace")
+        self.assertEqual(work_trace["event_type"], "test_run")
+        self.assertIn("fetch_work_trace", work_trace)
+
+    def test_end_to_end_truth_derived_work_trace_and_unified_search_flow(self) -> None:
+        source_file = self.root / "e2e-session.jsonl"
+        source_file.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "entry_type": "chat_log",
+                            "source": "telegram-direct-import",
+                            "author_role": "human",
+                            "created_at": "2026-05-29T09:00:00+00:00",
+                            "content": "Please run the unittest before the Friday deploy.",
+                            "metadata": {"source_message_id": "m1"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "entry_type": "chat_log",
+                            "source": "telegram-direct-import",
+                            "author_role": "agent",
+                            "created_at": "2026-05-29T09:01:00+00:00",
+                            "content": "I will run the unittest and keep the raw record preserved.",
+                            "metadata": {"source_message_id": "m2"},
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        imported = import_session_jsonl(
+            self.paths,
+            {
+                "path": str(source_file),
+                "import_id": "import-e2e",
+                "source_session_id": "session-e2e",
+                "source_conversation_id": "telegram:713733361",
+            },
+        )
+        entry_ids = [item["entry_id"] for item in imported["imported"]]
+
+        brief_out = produce_conversation_briefs(
+            self.paths,
+            {"entry_ids": entry_ids, "limit": 10, "force": True},
+        )
+        memory_out = produce_compressed_memory(
+            self.paths,
+            {"entry_ids": entry_ids, "limit": 10, "force": True},
+        )
+
+        session_path = self.root / "e2e-openclaw-work-trace.jsonl"
+        self._write_openclaw_work_trace_fixture(session_path)
+        trace_out = import_openclaw_work_trace(
+            self.paths,
+            input_path=session_path,
+            session_key="agent:main:telegram:default:direct:713733361",
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry_ids[0]})
+        combined = search_all(self.paths, {"query": "unittest", "limit": 10})
+        brief_artifacts = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] == "conversation-brief"]
+        memory_artifacts = [artifact for artifact in detail["artifacts"] if artifact["artifact_type"] in {"memory", "compressed-memory"}]
+
+        self.assertGreaterEqual(brief_out["produced_count"], 1)
+        self.assertGreaterEqual(memory_out["produced_count"], 1)
+        self.assertEqual(trace_out["imported_count"], 3)
+        self.assertGreaterEqual(len(brief_artifacts), 1)
+        self.assertGreaterEqual(len(memory_artifacts), 1)
+        domains = {item["search_domain"] for item in combined["matches"]}
+        self.assertIn("conversation", domains)
+        self.assertIn("work_trace", domains)
+        self.assertGreaterEqual(combined["counts"]["compressed_memory_hits"], 1)
+
+    def test_cli_search_all_returns_combined_domains(self) -> None:
+        append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_message",
+                "source": "telegram",
+                "author_role": "human",
+                "content": "Scoped needle token for import search.",
+                "created_at": "2026-05-29T10:00:00+00:00",
+            },
+        )
+        append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "command",
+                "summary": "Scoped needle command run.",
+                "project": "agent-diary",
+                "created_at": "2026-05-29T10:05:00+00:00",
+            },
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "agent_diary.cli.main",
+                "--json",
+                "search-all",
+                "--query",
+                "scoped needle",
+                "--project",
+                "agent-diary",
+            ],
+            cwd=self.root,
+            env={**os.environ, "PYTHONPATH": str(Path.cwd() / "src")},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        body = json.loads(proc.stdout)
+        self.assertEqual(body["filters"]["project"], "agent-diary")
+        domains = {item["search_domain"] for item in body["matches"]}
+        self.assertIn("conversation", domains)
+        self.assertIn("work_trace", domains)
 
     def test_fetch_raw_entry_returns_authoritative_record(self) -> None:
         result = append_entry(
@@ -246,12 +533,120 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(out["overlay_type"], "annotation")
         self.assertTrue(Path(out["overlay_file"]).exists())
 
+    def test_cli_append_work_trace_command_works(self) -> None:
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "append-work-trace",
+            "--event-type",
+            "test_run",
+            "--summary",
+            "Ran focused work trace tests",
+            "--project",
+            "agent-diary",
+            "--details",
+            '{"command":"python3 -m unittest","result":"pass"}',
+            "--related-paths",
+            '["tests/test_append_entry_slice.py"]',
+            "--tags",
+            '["verification"]',
+        ]
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(completed.stdout)
+        self.assertIn("event_id", out)
+        self.assertIn("work_file", out)
+        self.assertTrue(Path(out["work_file"]).exists())
+
+    def test_cli_import_openclaw_work_trace_command_works(self) -> None:
+        session_path = self.root / "work-trace-cli.jsonl"
+        self._write_openclaw_work_trace_fixture(session_path)
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-openclaw-work-trace",
+            "--input-path",
+            str(session_path),
+            "--session-key",
+            "agent:main:telegram:default:direct:713733361",
+        ]
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(completed.stdout)
+        self.assertEqual(out["discovered_event_count"], 3)
+        self.assertEqual(out["imported_count"], 3)
+
+    def test_cli_append_entry_auto_records_command_work_trace(self) -> None:
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "append-entry",
+            "--entry-type",
+            "manual_note",
+            "--source",
+            "cli",
+            "--author-role",
+            "human",
+            "--content",
+            "cli command auto trace",
+            "--created-at",
+            "2026-05-29T11:00:00+00:00",
+        ]
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        subprocess.run(
+            cmd,
+            cwd=self.root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        listed = list_work_trace(self.paths, {"limit": 5, "offset": 0})
+        event_types = [item["event_type"] for item in listed["items"]]
+        self.assertIn("command", event_types)
+        self.assertIn("file_change", event_types)
+        command_event_id = next(item["event_id"] for item in listed["items"] if item["event_type"] == "command")
+        command_event = fetch_work_trace_event(self.paths, {"event_id": command_event_id})["event"]
+        self.assertEqual(command_event["details"]["command"], "append-entry")
+
     def test_status_handler_contract(self) -> None:
         body = status(self.paths)
         self.assertTrue(body["ok"])
         self.assertEqual(body["sqlite_path"], str(self.paths.sqlite_path))
 
     def test_http_routes_include_list_imports_and_producer_endpoints(self) -> None:
+        self.assertIn("/append_work_trace", AgentDiaryHandler.routes)
+        self.assertIn("/search_all", AgentDiaryHandler.routes)
+        self.assertIn("/search_work_trace", AgentDiaryHandler.routes)
+        self.assertIn("/fetch_work_trace", AgentDiaryHandler.routes)
+        self.assertIn("/list_work_trace", AgentDiaryHandler.routes)
         self.assertIn("/list_imports", AgentDiaryHandler.routes)
         self.assertIn("/append_overlay", AgentDiaryHandler.routes)
         self.assertIn("/produce_open_loops", AgentDiaryHandler.routes)
@@ -659,9 +1054,61 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "overlay-search-token", "limit": 5})
         self.assertEqual(results["match_summary"]["compressed_memory_hits"], 0)
-        self.assertTrue(results["match_summary"]["using_fallback"])
+        self.assertEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(len(results["matches"]), 1)
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
+
+    def test_search_memory_merges_raw_and_compressed_hits_per_entry(self) -> None:
+        raw_first = append_entry(
+            self.paths,
+            {
+                "entry_type": "manual_note",
+                "source": "cli",
+                "author_role": "human",
+                "content": "Ship the exact phrase mac-side route before noon.",
+                "created_at": "2026-05-22T10:06:00+00:00",
+            },
+        )
+        compressed_only = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "raw body without the target phrase",
+                "created_at": "2026-05-22T10:07:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": raw_first["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "agent-v1",
+                "content": "summary mentions route planning in softer terms",
+                "created_at": "2026-05-22T10:08:00+00:00",
+            },
+        )
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": compressed_only["entry_id"],
+                "artifact_type": "compressed-memory",
+                "producer": "agent-v1",
+                "content": "compressed memory explicitly mentions mac-side route work",
+                "created_at": "2026-05-22T10:09:00+00:00",
+            },
+        )
+
+        results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
+        self.assertEqual(results["matches"][0]["entry_id"], raw_first["entry_id"])
+        self.assertEqual(results["matches"][0]["match_layer"], "raw_entry_fallback")
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
+        self.assertIn("raw_entry", results["matches"][0]["supporting_layers"])
+        self.assertEqual(results["match_summary"]["compressed_memory_hits"], 2)
+        self.assertEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertEqual(results["match_summary"]["entry_matches"], 2)
 
     def test_search_memory_filters_compressed_hits_by_source_conversation_id(self) -> None:
         source_file_a = self.root / "search-compressed-scope-a.jsonl"
@@ -747,6 +1194,66 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(results["matches"][0]["entry_id"], entry_id_a)
         self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
 
+    def test_search_memory_scope_recall_scans_older_entries_outside_recent_global_slice(self) -> None:
+        older_file = self.root / "search-scope-older.jsonl"
+        older_file.write_text(
+            json.dumps(
+                {
+                    "entry_type": "chat_log",
+                    "source": "telegram-direct-import",
+                    "author_role": "human",
+                    "created_at": "2026-05-25T09:00:00+00:00",
+                    "content": "older scoped raw body without the phrase",
+                    "metadata": {"source_message_id": "older-scope-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        imported = import_session_jsonl(
+            self.paths,
+            {
+                "path": str(older_file),
+                "import_id": "import-search-scope-older",
+                "source_session_id": "session-search-scope-older",
+                "source_conversation_id": "telegram:scope-older",
+            },
+        )
+        entry_id = imported["imported"][0]["entry_id"]
+        attach_artifact(
+            self.paths,
+            {
+                "entry_id": entry_id,
+                "artifact_type": "compressed-memory",
+                "producer": "compressed-memory.v2",
+                "content": "scope-needle-rare appears only in this older scoped conversation",
+                "created_at": "2026-05-25T09:01:00+00:00",
+            },
+        )
+        for idx in range(260):
+            append_entry(
+                self.paths,
+                {
+                    "entry_type": "manual_note",
+                    "source": "cli",
+                    "author_role": "human",
+                    "content": f"newer unrelated filler note {idx}",
+                    "created_at": f"2026-05-25T12:{idx % 60:02d}:00+00:00",
+                },
+            )
+
+        results = search_memory(
+            self.paths,
+            {
+                "query": "scope-needle-rare",
+                "limit": 10,
+                "source_conversation_id": "telegram:scope-older",
+            },
+        )
+        self.assertEqual(len(results["matches"]), 1)
+        self.assertEqual(results["matches"][0]["entry_id"], entry_id)
+        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+
     def test_search_memory_raw_fallback_respects_import_id_and_truthful_only(self) -> None:
         imported_file_a = self.root / "search-fallback-import-a.jsonl"
         imported_file_a.write_text(
@@ -817,7 +1324,7 @@ class AppendEntrySliceTests(unittest.TestCase):
             },
         )
         self.assertEqual(scoped["match_summary"]["compressed_memory_hits"], 0)
-        self.assertTrue(scoped["match_summary"]["using_fallback"])
+        self.assertTrue(scoped["match_summary"]["using_raw_layer"])
         self.assertEqual(len(scoped["matches"]), 1)
         self.assertEqual(scoped["matches"][0]["entry_id"], imported_a["imported"][0]["entry_id"])
 
@@ -1072,6 +1579,10 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(artifact["artifact_id"], attached["artifact_id"])
         self.assertEqual(artifact["artifact_type"], "memory")
         self.assertEqual(artifact["producer"], "agent-v1")
+        self.assertEqual(detail["artifact_summary"]["total_count"], 1)
+        self.assertEqual(detail["artifact_summary"]["current_count"], 1)
+        self.assertEqual(detail["artifact_summary"]["artifact_types"], ["memory"])
+        self.assertEqual(detail["artifact_summary"]["current_by_type"]["memory"]["artifact_id"], attached["artifact_id"])
 
     def test_fetch_entry_detail_includes_conversation_brief_content(self) -> None:
         entry = append_entry(
@@ -1107,6 +1618,7 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(provenance.get("schema_version"), "conversation-brief.v1")
         self.assertEqual(provenance.get("method"), "deterministic-dialogue-brief-v1")
         self.assertEqual(provenance.get("source_entry_ids"), [entry["entry_id"]])
+        self.assertEqual(detail["entry_provenance"]["source_conversation_id"], None)
 
     def test_fetch_entry_detail_marks_latest_artifact_as_current_per_type(self) -> None:
         entry = append_entry(
@@ -1258,6 +1770,7 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(artifact["overlay_stale_reason"], "overlay_added_after_artifact_generation")
         self.assertEqual(artifact["latest_overlay_at"], "2026-05-23T10:06:00+00:00")
         self.assertEqual(artifact["artifact_generated_at"], "2026-05-23T10:05:00+00:00")
+        self.assertEqual(detail["artifact_summary"]["stale_count"], 1)
 
     def test_fetch_entry_detail_overlay_staleness_false_without_overlays(self) -> None:
         entry = append_entry(
@@ -1895,9 +2408,10 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "May 7 microcontractor", "limit": 5})
         self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
-        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
-        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn(results["matches"][0]["match_layer"], {"compressed_memory", "raw_entry_fallback"})
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
 
     def test_produce_compressed_memory_representative_transcript_improves_search_handles(self) -> None:
         entry = append_entry(
@@ -1920,10 +2434,11 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
         self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
-        self.assertEqual(results["match_summary"]["raw_entry_fallback_hits"], 0)
-        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertGreaterEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
-        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn(results["matches"][0]["match_layer"], {"compressed_memory", "raw_entry_fallback"})
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
         self.assertIn("mac-side route", results["matches"][0]["match_text"].lower())
 
     def test_produce_compressed_memory_search_portable_with_non_bill_tom_names(self) -> None:
@@ -1947,10 +2462,11 @@ class AppendEntrySliceTests(unittest.TestCase):
 
         results = search_memory(self.paths, {"query": "mac-side route", "limit": 5})
         self.assertGreaterEqual(results["match_summary"]["compressed_memory_hits"], 1)
-        self.assertEqual(results["match_summary"]["raw_entry_fallback_hits"], 0)
-        self.assertFalse(results["match_summary"]["using_fallback"])
+        self.assertGreaterEqual(results["match_summary"]["raw_entry_hits"], 1)
+        self.assertTrue(results["match_summary"]["using_raw_layer"])
         self.assertEqual(results["matches"][0]["entry_id"], entry["entry_id"])
-        self.assertEqual(results["matches"][0]["match_layer"], "compressed_memory")
+        self.assertIn(results["matches"][0]["match_layer"], {"compressed_memory", "raw_entry_fallback"})
+        self.assertIn("compressed_memory", results["matches"][0]["supporting_layers"])
         self.assertIn("mac-side route", results["matches"][0]["match_text"].lower())
 
         detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
@@ -2496,6 +3012,15 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(ingestion["import_id"], "import_test_truthful")
         self.assertEqual(ingestion["source_session_id"], "session-123")
         self.assertEqual(ingestion["source_conversation_id"], "telegram:713733361")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["audit"]["line_count"], 2)
+        self.assertEqual(manifest["audit"]["entry_type_counts"], {"chat_log": 2})
+        self.assertEqual(manifest["audit"]["author_role_counts"], {"agent": 1, "human": 1})
+        self.assertEqual(manifest["audit"]["source_counts"], {"telegram-direct-import": 2})
+        self.assertEqual(
+            manifest["audit"]["created_at_range"],
+            {"first": "2026-05-25T12:00:00+00:00", "last": "2026-05-25T12:01:00+00:00"},
+        )
 
     def test_import_session_jsonl_rejects_path_like_import_id_before_writes(self) -> None:
         source_file = self.root / "unsafe-import-id.jsonl"
@@ -2544,6 +3069,8 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(second["imported_count"], 0)
         self.assertEqual(second["skipped_count"], 1)
         self.assertEqual(second["skipped"][0]["reason"], "duplicate_source_item")
+        self.assertEqual(second["audit"]["duplicate_source_item_count"], 1)
+        self.assertEqual(second["audit"]["duplicate_existing_entry_ids"], [first["imported"][0]["entry_id"]])
 
     def test_list_entries_filters_by_source_conversation_id(self) -> None:
         source_file_a = self.root / "conversation-a.jsonl"
@@ -4094,6 +4621,157 @@ class AppendEntrySliceTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_openclaw_work_trace_fixture(self, path: Path) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session",
+                            "version": 3,
+                            "id": "session-work-1",
+                            "timestamp": "2026-05-29T10:00:00.000Z",
+                            "cwd": "/home/willard/projects/demo",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-1",
+                            "parentId": "prev",
+                            "timestamp": "2026-05-29T10:00:10.000Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-bash",
+                                        "name": "bash",
+                                        "arguments": {"command": "git status --short", "cwd": "/home/willard/projects/demo"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-1",
+                            "parentId": "assistant-call-1",
+                            "timestamp": "2026-05-29T10:00:11.000Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-bash",
+                                "toolName": "bash",
+                                "content": [{"type": "toolResult", "content": " M ui/app.js"}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-2",
+                            "parentId": "tool-result-1",
+                            "timestamp": "2026-05-29T10:01:00.000Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-exec",
+                                        "name": "exec_command",
+                                        "arguments": {"cmd": "PYTHONPATH=src python3 -m unittest tests.test_append_entry_slice -v", "workdir": "/home/willard/development/agent-diary"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-2",
+                            "parentId": "assistant-call-2",
+                            "timestamp": "2026-05-29T10:01:05.000Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-exec",
+                                "toolName": "exec_command",
+                                "content": [{"type": "toolResult", "content": json.dumps({"exit_code": 0, "output": "OK"})}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-3",
+                            "parentId": "tool-result-2",
+                            "timestamp": "2026-05-29T10:02:00.000Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-browser",
+                                        "name": "openclaw_browser",
+                                        "arguments": {"action": "snapshot"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-3",
+                            "parentId": "assistant-call-3",
+                            "timestamp": "2026-05-29T10:02:03.000Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-browser",
+                                "toolName": "openclaw_browser",
+                                "content": [{"type": "toolResult", "content": json.dumps({"ok": True, "targetId": "t1"})}],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "assistant-call-4",
+                            "parentId": "tool-result-3",
+                            "timestamp": "2026-05-29T10:03:00.000Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "id": "tool-call-message",
+                                        "name": "message",
+                                        "arguments": {"action": "send", "message": "done"},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "id": "tool-result-4",
+                            "parentId": "assistant-call-4",
+                            "timestamp": "2026-05-29T10:03:02.000Z",
+                            "message": {
+                                "role": "toolResult",
+                                "toolCallId": "tool-call-message",
+                                "toolName": "message",
+                                "content": [{"type": "toolResult", "content": json.dumps({"ok": True, "messageId": "1"})}],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     def _write_telegram_direct_import_fixture(self, inbound_path: Path, sessions_root: Path) -> None:
         inbound_path.write_text(
             json.dumps(
@@ -4762,6 +5440,8 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(result["items"][1]["import_id"], "import-old")
         self.assertEqual(result["items"][0]["source_session_id"], "session-new")
         self.assertTrue(result["items"][0]["batch_manifest_path"].endswith("import-new.json"))
+        self.assertEqual(result["items"][0]["audit"]["line_count"], 1)
+        self.assertEqual(result["items"][0]["audit"]["source_counts"], {"openclaw-session-import": 1})
 
     def test_list_imports_honors_limit(self) -> None:
         import_session_jsonl(
@@ -4828,6 +5508,78 @@ class AppendEntrySliceTests(unittest.TestCase):
         rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         self.assertEqual(rows[0]["author_role"], "agent")
         self.assertEqual(rows[0]["content"], "Done")
+
+    def test_extract_openclaw_work_trace_events_classifies_command_test_and_action(self) -> None:
+        session_path = self.root / "work-trace-session.jsonl"
+        self._write_openclaw_work_trace_fixture(session_path)
+
+        result = extract_openclaw_work_trace_events(
+            input_path=session_path,
+            session_key="agent:main:telegram:default:direct:713733361",
+        )
+
+        self.assertEqual(result["event_count"], 3)
+        event_types = [event["event_type"] for event in result["events"]]
+        self.assertEqual(event_types, ["command", "test_run", "action"])
+        self.assertEqual(result["events"][0]["details"]["tool_name"], "bash")
+        self.assertEqual(result["events"][1]["details"]["tool_name"], "exec_command")
+        self.assertEqual(result["events"][2]["details"]["tool_name"], "openclaw_browser")
+
+    def test_import_openclaw_work_trace_writes_events_and_repeat_skips_duplicates(self) -> None:
+        session_path = self.root / "work-trace-import.jsonl"
+        self._write_openclaw_work_trace_fixture(session_path)
+
+        first = import_openclaw_work_trace(
+            self.paths,
+            input_path=session_path,
+            session_key="agent:main:telegram:default:direct:713733361",
+        )
+        second = import_openclaw_work_trace(
+            self.paths,
+            input_path=session_path,
+            session_key="agent:main:telegram:default:direct:713733361",
+        )
+
+        self.assertEqual(first["discovered_event_count"], 3)
+        self.assertEqual(first["imported_count"], 3)
+        self.assertEqual(first["skipped_duplicate_count"], 0)
+        self.assertEqual(second["imported_count"], 0)
+        self.assertEqual(second["skipped_duplicate_count"], 3)
+
+        listed = list_work_trace(self.paths, {"limit": 10, "offset": 0})
+        self.assertEqual(len(listed["items"]), 3)
+
+    def test_backfill_openclaw_work_trace_session_key_imports_discovered_session_files(self) -> None:
+        trajectories = self.root / "trajectories-work-trace"
+        trajectories.mkdir(parents=True, exist_ok=True)
+        session_path = self.root / "work-trace-backfill.jsonl"
+        self._write_openclaw_work_trace_fixture(session_path)
+        (trajectories / "one.trajectory.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "session.started",
+                    "ts": "2026-05-29T10:00:00.000Z",
+                    "sessionId": "session-work-1",
+                    "sessionKey": "agent:main:telegram:default:direct:713733361",
+                    "data": {"sessionFile": str(session_path.resolve()), "threadId": "thread-1"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        out = backfill_openclaw_work_trace_session_key(
+            self.paths,
+            trajectories_root=trajectories,
+            session_key="agent:main:telegram:default:direct:713733361",
+            since="2026-05-29",
+            until="2026-05-30",
+        )
+
+        self.assertEqual(out["discovered_session_file_count"], 1)
+        self.assertEqual(out["processed_session_file_count"], 1)
+        self.assertEqual(out["discovered_event_count"], 3)
+        self.assertEqual(out["imported_count"], 3)
 
     def test_discover_openclaw_session_files_filters_by_session_key_and_time(self) -> None:
         trajectories = self.root / "trajectories"
