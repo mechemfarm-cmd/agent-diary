@@ -16,6 +16,10 @@ Initial backend/service/CLI scaffold for Agent Diary.
 
 - `docs/ui-v1-surface-contract.md`
 - `docs/future-derived-data-model.md`
+- `docs/work-trace-layer-v1.md`
+- `docs/release-v1-weekend-checklist.md`
+- `docs/review-prompt-sonnet-v1.md`
+- `docs/review-prompt-deepseek-v1.md`
 - `docs/open-loops-producer-v1.md`
 - `docs/guinea-pig-testing-quickstart.md`
 - `docs/ops-sync-authority.md`

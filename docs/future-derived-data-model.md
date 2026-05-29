@@ -6,8 +6,17 @@ Keep Agent Diary open for future derived views (charts, mood trends, longitudina
 ## Truth Model (unchanged)
 
 - `raw_entry` files are authoritative records.
+- future `work-trace` records capture meaningful execution activity without replacing conversation truth.
 - `compressed-memory` artifacts are retrieval aids.
 - future analytics/derived signals are **secondary artifacts**, never replacement truth.
+
+Keep these layers separate:
+
+1. conversation truth
+2. work trace
+3. derived interpretation
+
+See also: `docs/work-trace-layer-v1.md`
 
 ## Future derived artifact classes (examples)
 
@@ -26,6 +35,8 @@ These are examples, not a locked enum.
 Derived outputs belong in artifact records (`artifacts/` + index linkage), not in raw entries.
 
 Raw entries remain immutable source text. Derived outputs may be recomputed, replaced, or versioned as new interpretations.
+
+Work-trace records are also not raw entries, but they are not merely derived artifacts either. They are their own execution-provenance layer and should remain separable from both conversation truth and secondary interpretation.
 
 ## Linkage rule
 
