@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent Diary UI Shell</title>
-    <link rel="stylesheet" href="./styles.css?v=20260529a" />
+    <link rel="stylesheet" href="./styles.css?v=20260529b" />
   </head>
   <body>
     <a class="skip-link" href="#detailBody">Skip to diary entry</a>
@@ -44,16 +44,22 @@
         <section class="panel panel-timeline" aria-labelledby="timelineHeading">
           <h2 id="timelineHeading">Timeline</h2>
           <form id="browseScopeForm" class="browse-scope" aria-label="Timeline browse scope">
-            <label for="scopeConversationId">Conversation</label>
-            <input id="scopeConversationId" type="text" placeholder="telegram:713733361" />
-            <label for="scopeImportId">Import</label>
-            <input id="scopeImportId" type="text" placeholder="import-telegram-direct-..." />
-            <label class="scope-toggle">
-              <input id="scopeTruthfulOnly" type="checkbox" />
-              Truthful only
-            </label>
-            <button type="submit">Apply</button>
-            <button id="clearScopeBtn" type="button">Clear</button>
+            <div class="scope-field">
+              <label for="scopeConversationId">Conversation</label>
+              <input id="scopeConversationId" type="text" placeholder="telegram:713733361" />
+            </div>
+            <div class="scope-field">
+              <label for="scopeImportId">Import</label>
+              <input id="scopeImportId" type="text" placeholder="import-telegram-direct-..." />
+            </div>
+            <div class="scope-actions">
+              <label class="scope-toggle">
+                <input id="scopeTruthfulOnly" type="checkbox" />
+                Truthful only
+              </label>
+              <button type="submit">Apply</button>
+              <button id="clearScopeBtn" type="button">Clear</button>
+            </div>
           </form>
           <div class="panel-actions">
             <button id="prevPageBtn" aria-label="Previous timeline page">Prev</button>
@@ -135,6 +141,6 @@
       </aside>
     </main>
 
-    <script type="module" src="./app.js?v=20260529a"></script>
+    <script type="module" src="./app.js?v=20260529b"></script>
   </body>
 </html>

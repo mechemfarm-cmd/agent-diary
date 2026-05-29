@@ -619,15 +619,22 @@ body {
 
 .browse-scope {
   display: grid;
-  grid-template-columns: 1fr 1fr auto auto;
-  gap: 4px 8px;
-  align-items: center;
-  margin-bottom: 6px;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  align-items: end;
+  margin-bottom: 8px;
 }
 
 .browse-scope label {
   font-size: 0.72rem;
   color: var(--muted);
+}
+
+.scope-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
 }
 
 .browse-scope input[type="text"] {
@@ -637,6 +644,15 @@ body {
   background: rgba(255, 250, 241, 0.95);
   padding: 5px 9px;
   font-size: 0.78rem;
+  min-width: 0;
+}
+
+.scope-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
 }
 
 .scope-toggle {
@@ -644,6 +660,7 @@ body {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+  margin-right: auto;
 }
 
 .list {
