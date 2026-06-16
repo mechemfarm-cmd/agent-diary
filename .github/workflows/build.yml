@@ -15,16 +15,16 @@ jobs:
         include:
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bundle-suffix: linux
-            artifact-name: agent-diary-linux
+            suffix: linux
+            artifact: agent-diary-linux
           - platform: macos-latest
             target: aarch64-apple-darwin
-            bundle-suffix: macos
-            artifact-name: agent-diary-macos
+            suffix: macos
+            artifact: agent-diary-macos
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            bundle-suffix: windows
-            artifact-name: agent-diary-windows
+            suffix: windows
+            artifact: agent-diary-windows
 
     runs-on: ${{ matrix.platform }}
 
@@ -64,12 +64,11 @@ jobs:
       - name: Build Tauri app
         run: npm run tauri build
 
-      - name: Upload artifacts
+      - name: Upload bundle
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact-name }}
-          path: src-tauri/target/release/bundle/*
-          if-no-files-found: error
+          name: ${{ matrix.artifact }}
+          path: src-tauri/target/release/bundle/**/*
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -78,18 +77,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
 
+      - name: List files
+        run: find . -type f | sort
+
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: ncipollo/release-action@v1
         with:
-          files: |
-            agent-diary-linux/**/*
-            agent-diary-macos/**/*
-            agent-diary-windows/**/*
+          artifacts: "agent-diary-linux/*,agent-diary-macos/*,agent-diary-windows/*"
           draft: true
-          generate_release_notes: true
+          generateReleaseNotes: true
           name: Agent Diary v${{ github.ref_name }}
           body: |
             ## Agent Diary Desktop Client v${{ github.ref_name }}
@@ -100,5 +99,9 @@ jobs:
             ### Setup
             1. Install the agent-diary Python server on your Hermes machine: `pip install agent-diary`
             2. Start the server: `agent-diary serve --host 0.0.0.0 --port 8041`
-            3. Open this app and enter your server's address in the API Base field (e.g. `http://your-server:8041`)
-            4. Click Reload
+            3. Open this app and enter your server's address in the Server URL field
+            4. Click Connect
+
+            ### Notes
+            - macOS: if you see "unverified developer", right-click → Open
+            - All data stays on your server; this app is just a viewer
