@@ -9,6 +9,16 @@ data/artifacts/
 data/overlays/
 data/index/memory.db
 data/imports/
+data/hermes-import-tracker/
 
 # Runtime work trace outputs
 data/work_trace/
+
+# Node.js (Tauri tooling)
+node_modules/
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+
+# Python egg-info
+src/agent_diary.egg-info/

@@ -15,6 +15,7 @@ const STORAGE_KEY = "agentDiaryUiStateV2";
 
 const apiBaseInput = document.getElementById("apiBase");
 const reloadBtn = document.getElementById("reloadBtn");
+const statusDot = document.getElementById("statusDot");
 const prevPageBtn = document.getElementById("prevPageBtn");
 const nextPageBtn = document.getElementById("nextPageBtn");
 const refreshImportsBtn = document.getElementById("refreshImportsBtn");
@@ -114,6 +115,25 @@ async function post(path, payload) {
     throw new Error(data.error || `HTTP ${response.status}`);
   }
   return data.result || data;
+}
+
+async function checkConnection() {
+  const url = state.apiBase;
+  if (!url) { statusDot.className = "status-dot status-unknown"; return; }
+  statusDot.className = "status-dot status-unknown";
+  try {
+    const response = await fetch(`${url}/status`, { method: "GET", signal: AbortSignal.timeout(3000) });
+    if (response.ok) {
+      statusDot.className = "status-dot status-connected";
+      statusDot.title = "Connected to server";
+    } else {
+      statusDot.className = "status-dot status-error";
+      statusDot.title = `Server error: ${response.status}`;
+    }
+  } catch {
+    statusDot.className = "status-dot status-error";
+    statusDot.title = "Cannot reach server";
+  }
 }
 
 function renderTimeline(items) {
@@ -1211,6 +1231,7 @@ reloadBtn.addEventListener("click", async () => {
   renderScopeBar();
   await loadTimeline();
   await loadImports();
+  checkConnection();
 });
 
 prevPageBtn.addEventListener("click", async () => {
@@ -1285,6 +1306,7 @@ async function init() {
   state.apiBase = apiBaseInput.value.trim().replace(/\/$/, "");
   renderScopeBar();
   await loadTimeline();
+  checkConnection();
   if (state.searchQuery) {
     await runSearch(state.searchQuery);
   } else {

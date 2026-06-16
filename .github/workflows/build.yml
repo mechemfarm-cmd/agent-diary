@@ -1,0 +1,104 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundle-suffix: linux
+            artifact-name: agent-diary-linux
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            bundle-suffix: macos
+            artifact-name: agent-diary-macos
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundle-suffix: windows
+            artifact-name: agent-diary-windows
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies (Linux)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        run: npm run tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: src-tauri/target/release/bundle/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            agent-diary-linux/**/*
+            agent-diary-macos/**/*
+            agent-diary-windows/**/*
+          draft: true
+          generate_release_notes: true
+          name: Agent Diary v${{ github.ref_name }}
+          body: |
+            ## Agent Diary Desktop Client v${{ github.ref_name }}
+
+            ### Downloads
+            Download the package for your platform below.
+
+            ### Setup
+            1. Install the agent-diary Python server on your Hermes machine: `pip install agent-diary`
+            2. Start the server: `agent-diary serve --host 0.0.0.0 --port 8041`
+            3. Open this app and enter your server's address in the API Base field (e.g. `http://your-server:8041`)
+            4. Click Reload
