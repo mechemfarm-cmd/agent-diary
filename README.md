@@ -14,6 +14,7 @@ Initial backend/service/CLI scaffold for Agent Diary.
 
 ## Docs
 
+- `docs/user-guide-v1.md`
 - `docs/ui-v1-surface-contract.md`
 - `docs/future-derived-data-model.md`
 - `docs/work-trace-layer-v1.md`

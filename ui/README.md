@@ -16,6 +16,12 @@ This local UI focuses on raw-first truth inspection with provenance-scoped brows
   - `import_id`
   - `truthful_only`
 - Entry detail from `fetch_entry_detail`
+- Linked `Agent Work` panel in entry detail showing attached work-trace events:
+  - summary
+  - event type / actor / project / source surface
+  - touched paths
+  - related artifact ids
+  - structured event details
 - Explicit in-UI derived refresh controls in entry detail:
   - Refresh Open Loops
   - Refresh Conversation Briefs

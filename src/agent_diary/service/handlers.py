@@ -1761,12 +1761,27 @@ def fetch_entry_detail(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             "lifecycle_status": artifact.get("lifecycle_status"),
         }
 
+    work_trace_events = _find_work_trace_events_for_entry(paths, entry_id=str(entry["entry_id"]))
+
     return {
         "entry_id": entry["entry_id"],
         "raw_entry": entry,
         "entry_provenance": _resolve_entry_provenance_from_body(entry),
         "overlays": overlays,
         "artifacts": artifacts,
+        "work_trace": {
+            "events": work_trace_events,
+            "summary": {
+                "total_count": len(work_trace_events),
+                "event_types": sorted(
+                    {
+                        str(event.get("event_type", "")).strip()
+                        for event in work_trace_events
+                        if str(event.get("event_type", "")).strip()
+                    }
+                ),
+            },
+        },
         "artifact_summary": {
             "total_count": len(artifacts),
             "current_count": sum(1 for artifact in artifacts if artifact.get("is_current")),
@@ -1826,6 +1841,40 @@ def _find_linked_open_loop_artifacts(paths: Paths, *, entry_id: str, exclude_art
         )
     linked.sort(key=lambda a: (str(a.get("created_at", "")), str(a.get("artifact_id", ""))), reverse=True)
     return linked
+
+
+def _find_work_trace_events_for_entry(paths: Paths, *, entry_id: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for work_file in paths.work_trace_dir.rglob("*.json"):
+        try:
+            body = json.loads(work_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        related_entry_ids = [str(item).strip() for item in body.get("related_entry_ids", []) if str(item).strip()]
+        if entry_id not in related_entry_ids:
+            continue
+        details = body.get("details")
+        events.append(
+            {
+                "event_id": body.get("event_id"),
+                "event_type": body.get("event_type"),
+                "summary": body.get("summary"),
+                "created_at": body.get("created_at"),
+                "project": body.get("project"),
+                "source_surface": body.get("source_surface"),
+                "actor": body.get("actor"),
+                "session_key": body.get("session_key"),
+                "task_id": body.get("task_id"),
+                "details": details if isinstance(details, dict) else {},
+                "related_entry_ids": related_entry_ids,
+                "related_artifact_ids": [str(item).strip() for item in body.get("related_artifact_ids", []) if str(item).strip()],
+                "related_paths": [str(item).strip() for item in body.get("related_paths", []) if str(item).strip()],
+                "tags": [str(item).strip() for item in body.get("tags", []) if str(item).strip()],
+                "work_file_path": str(work_file),
+            }
+        )
+    events.sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("event_id", ""))), reverse=True)
+    return events
 
 
 def produce_open_loops(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:

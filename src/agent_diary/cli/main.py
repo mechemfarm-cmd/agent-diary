@@ -248,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one-step truthful import for Telegram direct chat transcripts",
         description="Build canonical Telegram-direct transcript from inbound Telegram logs plus OpenClaw session message.send events, then chunk and import through the truthful recurring-ingestion path.",
     )
-    p_telegram_direct_import.add_argument("--inbound-path", required=True, help="path to Telegram inbound log JSONL")
+    p_telegram_direct_import.add_argument("--inbound-path", required=True, help="path to Telegram inbound log JSONL or OpenClaw plugin-state SQLite")
     p_telegram_direct_import.add_argument("--sessions-root", required=True, help="directory containing OpenClaw session *.jsonl files")
     p_telegram_direct_import.add_argument("--chat-id", required=True, help="Telegram chat id to import")
     p_telegram_direct_import.add_argument("--source", default="telegram-direct-import", help="source label stored on imported raw entries")
@@ -306,7 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="truth-first backfill for one Telegram direct chat using trajectory-scoped session discovery",
         description="Discover OpenClaw session files from trajectory metadata for one session key and backfill that window through Telegram-direct reconstruction (inbound Telegram log + outbound message.send events).",
     )
-    p_backfill_telegram.add_argument("--inbound-path", required=True, help="path to Telegram inbound log JSONL")
+    p_backfill_telegram.add_argument("--inbound-path", required=True, help="path to Telegram inbound log JSONL or OpenClaw plugin-state SQLite")
     p_backfill_telegram.add_argument("--sessions-root", required=True, help="directory containing OpenClaw session *.jsonl files")
     p_backfill_telegram.add_argument("--trajectories-root", default="~/.openclaw/agents/main/sessions", help="directory containing *.trajectory.jsonl files")
     p_backfill_telegram.add_argument("--session-key", required=True, help="OpenClaw session key used for trajectory-scoped discovery")
@@ -359,7 +359,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="reconstruct a two-sided Telegram direct-chat transcript from Telegram-side logs and session-file sent messages",
         description="Build canonical transcript JSONL for one Telegram direct chat by combining inbound Telegram logs with assistant message sends recovered from OpenClaw session files.",
     )
-    p_build_telegram_direct.add_argument("--inbound-path", required=True, help="path to sessions.json.telegram-messages.json")
+    p_build_telegram_direct.add_argument("--inbound-path", required=True, help="path to sessions.json.telegram-messages.json or OpenClaw plugin-state SQLite")
     p_build_telegram_direct.add_argument("--sessions-root", required=True, help="directory containing OpenClaw session *.jsonl files")
     p_build_telegram_direct.add_argument("--chat-id", required=True, help="Telegram chat id to reconstruct")
     p_build_telegram_direct.add_argument("--output-path", required=True, help="output path for canonical transcript JSONL")

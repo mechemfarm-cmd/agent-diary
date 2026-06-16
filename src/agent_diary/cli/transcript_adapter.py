@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -384,6 +385,118 @@ def _load_openclaw_telegram_jsonl(path: Path) -> tuple[list[dict[str, Any]], str
     return rows, inferred_session, inferred_conversation
 
 
+def _build_telegram_inbound_row(
+    *,
+    source_message: dict[str, Any],
+    line_hint: str,
+    source_key: str | None = None,
+    source_store: str | None = None,
+) -> dict[str, Any]:
+    role = _author_role_from_telegram_message(source_message)
+    speaker = _speaker_from_telegram_message(source_message, role)
+    content = _require_content(source_message, line_hint=line_hint)
+    created_at = _iso_from_unix_seconds(source_message.get("date"), line_hint=line_hint)
+    message_id = _non_empty_str(source_message.get("message_id"))
+    chat = source_message.get("chat", {})
+    chat_value = chat.get("id") if isinstance(chat, dict) else None
+    sender = source_message.get("from", {})
+    metadata = {
+        "transport": "telegram",
+        "telegram_direction": "inbound",
+        "source_message_id": message_id,
+        "source_key": source_key,
+        "source_store": source_store,
+        "telegram_chat_id": chat_value,
+        "telegram_from_id": sender.get("id") if isinstance(sender, dict) else None,
+        "telegram_username": sender.get("username") if isinstance(sender, dict) else None,
+        "is_bot": sender.get("is_bot") if isinstance(sender, dict) else None,
+    }
+    metadata = {k: v for k, v in metadata.items() if v not in (None, "")}
+    return {
+        "line_hint": line_hint,
+        "message": {
+            "message_id": message_id,
+            "created_at": created_at,
+            "author_role": role,
+            "speaker": speaker,
+            "content": content,
+            "metadata": metadata,
+        },
+    }
+
+
+def _load_openclaw_telegram_plugin_state_sqlite(path: Path, *, chat_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with sqlite3.connect(path) as conn:
+        cursor = conn.execute(
+            """
+            SELECT entry_key, value_json
+            FROM plugin_state_entries
+            WHERE namespace = ?
+              AND entry_key LIKE ?
+            ORDER BY created_at ASC, entry_key ASC
+            """,
+            ("telegram.message-cache", f"%:{chat_id}:%"),
+        )
+        for entry_key, value_json in cursor.fetchall():
+            payload = json.loads(value_json)
+            if not isinstance(payload, dict):
+                continue
+            source_message = payload.get("sourceMessage")
+            if not isinstance(source_message, dict):
+                continue
+            chat = source_message.get("chat", {})
+            chat_value = chat.get("id") if isinstance(chat, dict) else None
+            if str(chat_value) != str(chat_id):
+                continue
+            sender = source_message.get("from", {})
+            if isinstance(sender, dict) and sender.get("is_bot") is True:
+                continue
+            rows.append(
+                _build_telegram_inbound_row(
+                    source_message=source_message,
+                    line_hint=f"sqlite:{entry_key}",
+                    source_key=str(entry_key),
+                    source_store="openclaw-plugin-state-sqlite",
+                )
+            )
+    return rows
+
+
+def _load_openclaw_telegram_inbound_source(path: Path, *, chat_id: str) -> list[dict[str, Any]]:
+    if path.suffix == ".sqlite":
+        return _load_openclaw_telegram_plugin_state_sqlite(path, chat_id=chat_id)
+
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            outer = json.loads(raw)
+            if not isinstance(outer, dict):
+                raise ValueError(f"line {line_number}: telegram record must be an object")
+            node = outer.get("node", {})
+            if not isinstance(node, dict):
+                raise ValueError(f"line {line_number}: node must be an object")
+            source_message = node.get("sourceMessage")
+            if not isinstance(source_message, dict):
+                raise ValueError(f"line {line_number}: missing node.sourceMessage object")
+            chat = source_message.get("chat", {})
+            chat_value = chat.get("id") if isinstance(chat, dict) else None
+            if str(chat_value) != str(chat_id):
+                continue
+            rows.append(
+                _build_telegram_inbound_row(
+                    source_message=source_message,
+                    line_hint=f"line {line_number}",
+                    source_key=outer.get("key"),
+                    source_store="openclaw-telegram-jsonl",
+                )
+            )
+    return rows
+
+
 def _parse_tool_result_payload(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return value
@@ -397,6 +510,29 @@ def _parse_tool_result_payload(value: Any) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _message_send_call_targets_current_conversation(arguments: dict[str, Any]) -> bool:
+    explicit_target_keys = {
+        "target",
+        "targets",
+        "channel",
+        "channelId",
+        "channelIds",
+        "chatId",
+        "threadId",
+        "guildId",
+        "groupId",
+        "accountId",
+        "openId",
+        "participant",
+        "unionId",
+    }
+    for key in explicit_target_keys:
+        value = arguments.get(key)
+        if value not in (None, "", []):
+            return False
+    return True
 
 
 def _assistant_sent_messages_from_session_files(
@@ -451,6 +587,7 @@ def _assistant_sent_messages_from_session_files(
                             "call_timestamp": _non_empty_str(obj.get("timestamp") or message.get("timestamp")),
                             "runtime_record_id": _non_empty_str(obj.get("id")),
                             "session_file": str(path.resolve()),
+                            "targets_current_conversation": _message_send_call_targets_current_conversation(arguments),
                         }
                     continue
 
@@ -477,9 +614,13 @@ def _assistant_sent_messages_from_session_files(
                     continue
                 payload_chat_id = payload.get("chatId")
                 payload_message_id = payload.get("messageId")
-                if payload_chat_id is None or payload_message_id in (None, ""):
+                if payload_message_id in (None, ""):
                     continue
-                if str(payload_chat_id) != str(chat_id):
+                if payload_chat_id in (None, ""):
+                    if pending_item.get("targets_current_conversation") is not True:
+                        continue
+                    payload_chat_id = chat_id
+                elif str(payload_chat_id) != str(chat_id):
                     continue
                 created_at = _non_empty_str(obj.get("timestamp") or message.get("timestamp"))
                 rows.append(
@@ -520,62 +661,22 @@ def build_openclaw_telegram_direct_transcript(
     since: datetime | None = None,
     until: datetime | None = None,
 ) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
+    rows = _load_openclaw_telegram_inbound_source(inbound_path, chat_id=chat_id)
     first_inbound_at: datetime | None = None
-    with inbound_path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            raw = line.strip()
-            if not raw:
-                continue
-            outer = json.loads(raw)
-            if not isinstance(outer, dict):
-                raise ValueError(f"line {line_number}: telegram record must be an object")
-            node = outer.get("node", {})
-            if not isinstance(node, dict):
-                raise ValueError(f"line {line_number}: node must be an object")
-            source_message = node.get("sourceMessage")
-            if not isinstance(source_message, dict):
-                raise ValueError(f"line {line_number}: missing node.sourceMessage object")
-            chat = source_message.get("chat", {})
-            chat_value = chat.get("id") if isinstance(chat, dict) else None
-            if str(chat_value) != str(chat_id):
-                continue
-            role = _author_role_from_telegram_message(source_message)
-            speaker = _speaker_from_telegram_message(source_message, role)
-            content = _require_content(source_message, line_hint=f"line {line_number}")
-            created_at = _iso_from_unix_seconds(source_message.get("date"), line_hint=f"line {line_number}")
-            created_at_dt = _parse_iso_datetime(created_at, line_hint=f"line {line_number}")
-            if since and created_at_dt < since:
-                continue
-            if until and created_at_dt >= until:
-                continue
-            message_id = _non_empty_str(source_message.get("message_id"))
-            metadata = {
-                "transport": "telegram",
-                "telegram_direction": "inbound",
-                "source_message_id": message_id,
-                "source_key": outer.get("key"),
-                "telegram_chat_id": chat_value,
-                "telegram_from_id": source_message.get("from", {}).get("id") if isinstance(source_message.get("from"), dict) else None,
-                "telegram_username": source_message.get("from", {}).get("username") if isinstance(source_message.get("from"), dict) else None,
-                "is_bot": source_message.get("from", {}).get("is_bot") if isinstance(source_message.get("from"), dict) else None,
-            }
-            metadata = {k: v for k, v in metadata.items() if v not in (None, "")}
-            rows.append(
-                {
-                    "line_hint": f"line {line_number}",
-                    "message": {
-                        "message_id": message_id,
-                        "created_at": created_at,
-                        "author_role": role,
-                        "speaker": speaker,
-                        "content": content,
-                        "metadata": metadata,
-                    },
-                }
-            )
-            if first_inbound_at is None or created_at_dt < first_inbound_at:
-                first_inbound_at = created_at_dt
+    filtered_rows: list[dict[str, Any]] = []
+    for row in rows:
+        created_at_dt = _parse_iso_datetime(
+            row["message"]["created_at"],
+            line_hint=row["line_hint"],
+        )
+        if since and created_at_dt < since:
+            continue
+        if until and created_at_dt >= until:
+            continue
+        filtered_rows.append(row)
+        if first_inbound_at is None or created_at_dt < first_inbound_at:
+            first_inbound_at = created_at_dt
+    rows = filtered_rows
 
     outbound_rows = _assistant_sent_messages_from_session_files(
         sessions_root=sessions_root,

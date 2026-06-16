@@ -1551,6 +1551,45 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(detail["truth_model"]["primary"], "raw_entry")
         self.assertEqual(detail["truth_model"]["secondary"], "artifacts")
 
+    def test_fetch_entry_detail_includes_linked_work_trace_events(self) -> None:
+        entry = append_entry(
+            self.paths,
+            {
+                "entry_type": "chat_log",
+                "source": "openclaw",
+                "author_role": "agent",
+                "content": "Working through the UI panel decision.",
+                "created_at": "2026-05-23T10:00:00+00:00",
+            },
+        )
+        append_work_trace_event(
+            self.paths,
+            {
+                "event_type": "file_change",
+                "summary": "Added the Agent Work panel to the UI.",
+                "created_at": "2026-05-23T10:02:00+00:00",
+                "project": "agent-diary",
+                "actor": "tom",
+                "source_surface": "openclaw-session",
+                "related_entry_ids": [entry["entry_id"]],
+                "related_paths": ["ui/index.html", "ui/app.js"],
+                "details": {"change_kind": "update", "area": "right-side panel"},
+            },
+        )
+
+        detail = fetch_entry_detail(self.paths, {"entry_id": entry["entry_id"]})
+        self.assertGreaterEqual(detail["work_trace"]["summary"]["total_count"], 1)
+        self.assertIn("file_change", detail["work_trace"]["summary"]["event_types"])
+        event = next(
+            item
+            for item in detail["work_trace"]["events"]
+            if item["summary"] == "Added the Agent Work panel to the UI."
+        )
+        self.assertEqual(event["summary"], "Added the Agent Work panel to the UI.")
+        self.assertEqual(event["related_entry_ids"], [entry["entry_id"]])
+        self.assertEqual(event["related_paths"], ["ui/index.html", "ui/app.js"])
+        self.assertEqual(event["details"]["area"], "right-side panel")
+
     def test_fetch_entry_detail_includes_artifact_linkage_metadata(self) -> None:
         entry = append_entry(
             self.paths,
@@ -4296,6 +4335,46 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(rows[1]["metadata"]["telegram_direction"], "outbound")
         self.assertEqual(rows[1]["metadata"]["source_runtime_tool_call_id"], "tool-call-1")
 
+    def test_build_openclaw_telegram_direct_transcript_reads_plugin_state_sqlite(self) -> None:
+        inbound = self.root / "telegram-plugin-state.sqlite"
+        sessions_root = self.root / "sessions-plugin-state"
+        self._write_telegram_plugin_state_fixture(inbound, sessions_root)
+
+        out_path = self.root / "telegram-direct-transcript-sqlite.jsonl"
+        result = build_openclaw_telegram_direct_transcript(
+            inbound_path=inbound,
+            sessions_root=sessions_root,
+            output_path=out_path,
+            chat_id="713733361",
+        )
+        self.assertEqual(result["message_count"], 2)
+        self.assertEqual(result["inbound_count"], 1)
+        self.assertEqual(result["outbound_count"], 1)
+        rows = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual([row["message_id"] for row in rows], ["7001", "7002"])
+        self.assertEqual(rows[0]["metadata"]["source_store"], "openclaw-plugin-state-sqlite")
+        self.assertEqual(rows[0]["metadata"]["telegram_direction"], "inbound")
+
+    def test_build_openclaw_telegram_direct_transcript_accepts_message_result_without_chat_id(self) -> None:
+        inbound = self.root / "telegram-plugin-state-no-chat-id.sqlite"
+        sessions_root = self.root / "sessions-plugin-state-no-chat-id"
+        self._write_telegram_plugin_state_fixture(inbound, sessions_root, omit_result_chat_id=True)
+
+        out_path = self.root / "telegram-direct-transcript-no-chat-id.jsonl"
+        result = build_openclaw_telegram_direct_transcript(
+            inbound_path=inbound,
+            sessions_root=sessions_root,
+            output_path=out_path,
+            chat_id="713733361",
+        )
+        self.assertEqual(result["message_count"], 2)
+        self.assertEqual(result["inbound_count"], 1)
+        self.assertEqual(result["outbound_count"], 1)
+        rows = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual([row["message_id"] for row in rows], ["7001", "7002"])
+        self.assertEqual(rows[1]["metadata"]["telegram_chat_id"], "713733361")
+        self.assertEqual(rows[1]["metadata"]["telegram_direction"], "outbound")
+
     def test_build_openclaw_telegram_direct_transcript_drops_outbound_before_inbound_window(self) -> None:
         inbound = self.root / "telegram-messages-window.json"
         inbound.write_text(
@@ -4791,8 +4870,83 @@ class AppendEntrySliceTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        self._write_telegram_direct_sessions_fixture(sessions_root)
+
+    def _write_telegram_plugin_state_fixture(
+        self,
+        sqlite_path: Path,
+        sessions_root: Path,
+        *,
+        omit_result_chat_id: bool = False,
+    ) -> None:
+        with sqlite3.connect(sqlite_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE plugin_state_entries (
+                    plugin_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    entry_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    PRIMARY KEY (plugin_id, namespace, entry_key)
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO plugin_state_entries (plugin_id, namespace, entry_key, value_json, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                [
+                    (
+                        "telegram",
+                        "telegram.message-cache",
+                        "scope:default:713733361:7001",
+                        json.dumps(
+                            {
+                                "sourceMessage": {
+                                    "message_id": 7001,
+                                    "from": {"id": 713733361, "is_bot": False, "username": "Willardmechem"},
+                                    "chat": {"id": 713733361, "type": "private"},
+                                    "date": 1778925595,
+                                    "text": "hello tom",
+                                }
+                            }
+                        ),
+                        1778925595000,
+                    ),
+                    (
+                        "telegram",
+                        "telegram.message-cache",
+                        "scope:default:713733361:7002",
+                        json.dumps(
+                            {
+                                "sourceMessage": {
+                                    "message_id": 7002,
+                                    "from": {"id": 8682079149, "is_bot": True, "username": "willhowardbot"},
+                                    "chat": {"id": 713733361, "type": "private"},
+                                    "date": 1778925611,
+                                    "text": "hi bill",
+                                }
+                            }
+                        ),
+                        1778925611000,
+                    ),
+                ],
+            )
+            conn.commit()
+        self._write_telegram_direct_sessions_fixture(
+            sessions_root,
+            omit_result_chat_id=omit_result_chat_id,
+        )
+
+    def _write_telegram_direct_sessions_fixture(self, sessions_root: Path, *, omit_result_chat_id: bool = False) -> None:
         sessions_root.mkdir(parents=True, exist_ok=True)
         session_file = sessions_root / "run-1.jsonl"
+        result_payload = {"ok": True, "messageId": "7002"}
+        if not omit_result_chat_id:
+            result_payload["chatId"] = "713733361"
         session_file.write_text(
             "\n".join(
                 [
@@ -4829,7 +4983,7 @@ class AppendEntrySliceTests(unittest.TestCase):
                                 "content": [
                                     {
                                         "type": "toolResult",
-                                        "content": json.dumps({"ok": True, "messageId": "7002", "chatId": "713733361"}),
+                                        "content": json.dumps(result_payload),
                                     }
                                 ],
                             },
@@ -4964,6 +5118,41 @@ class AppendEntrySliceTests(unittest.TestCase):
         self.assertEqual(ingestion["truthful_source"], True)
         self.assertEqual(ingestion["source_session_id"], "telegram-direct:713733361")
         self.assertEqual(ingestion["source_conversation_id"], "telegram:713733361")
+
+    def test_import_telegram_direct_command_imports_plugin_state_sqlite_fixture(self) -> None:
+        inbound = self.root / "telegram-plugin-state-import.sqlite"
+        sessions_root = self.root / "sessions-plugin-state-import"
+        self._write_telegram_plugin_state_fixture(inbound, sessions_root)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_diary.cli.main",
+            "--json",
+            "import-telegram-direct",
+            "--inbound-path",
+            str(inbound),
+            "--sessions-root",
+            str(sessions_root),
+            "--chat-id",
+            "713733361",
+            "--source",
+            "telegram-direct-import",
+            "--import-id",
+            "import-telegram-direct-plugin-state-test",
+        ]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path.cwd() / "src")
+        completed = subprocess.run(cmd, cwd=self.root, env=env, check=True, capture_output=True, text=True)
+
+        out = json.loads(completed.stdout)
+        self.assertFalse(out["dry_run"])
+        self.assertEqual(out["transcript_message_count"], 2)
+        self.assertEqual(out["imported_count"], 1)
+        entry_id = out["import_result"]["imported"][0]["entry_id"]
+        fetched = fetch_raw_entry(self.paths, {"entry_id": entry_id})
+        self.assertIn("Willardmechem: hello tom", fetched["entry"]["content"])
+        self.assertIn("Assistant: hi bill", fetched["entry"]["content"])
 
     def test_import_telegram_direct_command_dry_run_does_not_write_raw_entries(self) -> None:
         inbound = self.root / "telegram-messages-dry-run.jsonl"

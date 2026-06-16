@@ -1053,6 +1053,44 @@ body {
   line-height: 1.5;
 }
 
+.work-trace-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.work-trace-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.work-trace-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid rgba(185, 141, 100, 0.45);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  color: #6c4735;
+  background: rgba(255, 249, 239, 0.9);
+}
+
+.work-trace-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.work-trace-subhead {
+  margin: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 .artifact-status-bar {
   display: flex;
   flex-wrap: wrap;

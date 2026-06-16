@@ -35,6 +35,8 @@ const briefDetails = document.getElementById("briefDetails");
 const briefBody = document.getElementById("briefBody");
 const memoryDetails = document.getElementById("memoryDetails");
 const memoryArtifactList = document.getElementById("memoryArtifactList");
+const workTraceDetails = document.getElementById("workTraceDetails");
+const workTraceList = document.getElementById("workTraceList");
 const overlayDetails = document.getElementById("overlayDetails");
 const overlayList = document.getElementById("overlayList");
 const overlayForm = document.getElementById("overlayForm");
@@ -422,7 +424,99 @@ function renderLoops(loopArtifacts) {
   }
 }
 
-function renderArtifactStatusBar(briefArtifacts, loopArtifacts, overlays, memoryArtifacts) {
+function renderWorkTrace(workTraceEvents) {
+  workTraceList.innerHTML = "";
+  if (!workTraceEvents.length) {
+    workTraceList.innerHTML = '<li class="item muted">No recorded agent work is attached to this entry yet.</li>';
+    workTraceDetails.open = false;
+    return;
+  }
+  for (const event of workTraceEvents) {
+    const li = document.createElement("li");
+    li.className = "item";
+
+    const card = document.createElement("div");
+    card.className = "work-trace-card";
+
+    const title = document.createElement("div");
+    const strong = document.createElement("strong");
+    strong.textContent = event.summary || event.event_type || "Work event";
+    title.appendChild(strong);
+    card.appendChild(title);
+
+    const meta = document.createElement("div");
+    meta.className = "work-trace-meta";
+    for (const value of [
+      event.event_type,
+      event.actor,
+      event.project,
+      event.source_surface,
+      event.task_id ? `task ${event.task_id}` : "",
+      event.session_key ? `session ${event.session_key}` : "",
+    ]) {
+      if (!value) continue;
+      const pill = document.createElement("span");
+      pill.className = "work-trace-pill";
+      pill.textContent = value;
+      meta.appendChild(pill);
+    }
+    if (meta.childElementCount) {
+      card.appendChild(meta);
+    }
+
+    const when = document.createElement("div");
+    when.className = "muted";
+    when.textContent = formatMetaDateTime(event.created_at || "");
+    card.appendChild(when);
+
+    if (Array.isArray(event.related_paths) && event.related_paths.length) {
+      const pathsLabel = document.createElement("p");
+      pathsLabel.className = "work-trace-subhead";
+      pathsLabel.textContent = "Touched Paths";
+      card.appendChild(pathsLabel);
+
+      const pathWrap = document.createElement("div");
+      pathWrap.className = "work-trace-links";
+      for (const path of event.related_paths) {
+        const pill = document.createElement("span");
+        pill.className = "work-trace-pill";
+        pill.textContent = path;
+        pathWrap.appendChild(pill);
+      }
+      card.appendChild(pathWrap);
+    }
+
+    if (Array.isArray(event.related_artifact_ids) && event.related_artifact_ids.length) {
+      const artifactsLabel = document.createElement("p");
+      artifactsLabel.className = "work-trace-subhead";
+      artifactsLabel.textContent = "Related Artifacts";
+      card.appendChild(artifactsLabel);
+
+      const artifactWrap = document.createElement("div");
+      artifactWrap.className = "work-trace-links";
+      for (const artifactId of event.related_artifact_ids) {
+        const pill = document.createElement("span");
+        pill.className = "work-trace-pill";
+        pill.textContent = artifactId;
+        artifactWrap.appendChild(pill);
+      }
+      card.appendChild(artifactWrap);
+    }
+
+    if (event.details && Object.keys(event.details).length) {
+      const detailsPre = document.createElement("pre");
+      detailsPre.className = "artifact-body";
+      detailsPre.textContent = JSON.stringify(event.details, null, 2);
+      card.appendChild(detailsPre);
+    }
+
+    li.appendChild(card);
+    workTraceList.appendChild(li);
+  }
+  workTraceDetails.open = true;
+}
+
+function renderArtifactStatusBar(briefArtifacts, loopArtifacts, overlays, memoryArtifacts, workTraceEvents) {
   const hasStale = [...briefArtifacts, ...loopArtifacts, ...memoryArtifacts].some(
     (artifact) => artifact?.overlay_stale === true
   );
@@ -438,23 +532,34 @@ function renderArtifactStatusBar(briefArtifacts, loopArtifacts, overlays, memory
   if (overlays.length) {
     pills.push('<span class="status-pill">Overlays: ' + overlays.length + "</span>");
   }
+  if (workTraceEvents.length) {
+    pills.push('<span class="status-pill">Work: ' + workTraceEvents.length + '</span>');
+  }
   if (hasStale) {
     pills.push('<span class="status-pill status-pill-stale">STALE</span>');
   }
   artifactStatusBar.innerHTML = pills.join("");
 }
 
-function renderInterpHeader(briefArtifacts, loopArtifacts, memoryArtifacts) {
+function renderInterpHeader(briefArtifacts, loopArtifacts, memoryArtifacts, workTraceEvents) {
   const allArtifacts = [...briefArtifacts, ...loopArtifacts, ...memoryArtifacts];
   const staleCount = allArtifacts.filter((artifact) => artifact?.overlay_stale === true).length;
-  if (!allArtifacts.length) {
+  if (!allArtifacts.length && !workTraceEvents.length) {
     interpHeader.textContent = "";
     interpHeader.classList.remove("has-stale");
     return;
   }
-  interpHeader.textContent = staleCount
-    ? allArtifacts.length + " artifacts · ⚠ " + staleCount + " may be stale"
-    : allArtifacts.length + " artifacts";
+  const pieces = [];
+  if (allArtifacts.length) {
+    pieces.push(allArtifacts.length + " artifacts");
+  }
+  if (workTraceEvents.length) {
+    pieces.push(workTraceEvents.length + " work events");
+  }
+  if (staleCount) {
+    pieces.push("⚠ " + staleCount + " may be stale");
+  }
+  interpHeader.textContent = pieces.join(" · ");
   interpHeader.classList.toggle("has-stale", staleCount > 0);
 }
 
@@ -538,6 +643,7 @@ function renderDetail(detail) {
   const raw = detail.raw_entry;
   const overlays = Array.isArray(detail.overlays) ? detail.overlays : [];
   const artifacts = Array.isArray(detail.artifacts) ? detail.artifacts : [];
+  const workTraceEvents = Array.isArray(detail.work_trace?.events) ? detail.work_trace.events : [];
   artifactStatusBar.innerHTML = "";
   const memoryArtifacts = artifacts.filter((artifact) =>
     ["memory", "compressed-memory"].includes(artifact.artifact_type)
@@ -618,6 +724,8 @@ function renderDetail(detail) {
   memoryDetails.hidden = memoryArtifacts.length === 0;
   memoryDetails.open = false;
 
+  renderWorkTrace(workTraceEvents);
+
   overlayList.innerHTML = "";
   if (!overlays.length) {
     overlayList.innerHTML = '<li class="item muted">No overlays attached.</li>';
@@ -669,8 +777,8 @@ function renderDetail(detail) {
       await loadEntry(id);
     });
   }
-  renderArtifactStatusBar(briefArtifacts, loopArtifacts, overlays, memoryArtifacts);
-  renderInterpHeader(briefArtifacts, loopArtifacts, memoryArtifacts);
+  renderArtifactStatusBar(briefArtifacts, loopArtifacts, overlays, memoryArtifacts, workTraceEvents);
+  renderInterpHeader(briefArtifacts, loopArtifacts, memoryArtifacts, workTraceEvents);
   artifactDetails.open = false;
 }
 
