@@ -15,16 +15,10 @@ jobs:
         include:
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            suffix: linux
-            artifact: agent-diary-linux
           - platform: macos-latest
             target: x86_64-apple-darwin
-            suffix: macos-intel
-            artifact: agent-diary-macos
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            suffix: windows
-            artifact: agent-diary-windows
 
     runs-on: ${{ matrix.platform }}
 
@@ -62,35 +56,21 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        run: npm run tauri build
-
-      - name: Upload bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: src-tauri/target/release/bundle/**/*
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-
-      - name: Create Release
-        run: |
-          find . -type f -name "*.deb" -o -name "*.dmg" -o -name "*.msi" -o -name "*.AppImage" -o -name "*.rpm"
-          gh release create "${{ github.ref_name }}" \
-            --draft \
-            --generate-notes \
-            --title "Agent Diary ${{ github.ref_name }}" \
-            agent-diary-linux/agent-diary_*_amd64.deb \
-            agent-diary-linux/agent-diary-*.x86_64.rpm \
-            agent-diary-linux/agent-diary_*_amd64.AppImage \
-            agent-diary-macos/agent-diary_*.dmg \
-            agent-diary-windows/agent-diary_*.msi
+        uses: tauri-apps/tauri-action@v0
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Agent Diary ${{ github.ref_name }}'
+          releaseBody: |
+            ## Agent Diary ${{ github.ref_name }}
+
+            Desktop client for browsing your Hermes agent's memory.
+
+            **Setup:**
+            1. Install the agent-diary Python server on your Hermes machine
+            2. Start: `agent-diary serve --host 0.0.0.0 --port 8041`
+            3. Open this app and enter your server's address
+            4. Click Connect
+          releaseDraft: true
+          includeUpdaterJson: false
