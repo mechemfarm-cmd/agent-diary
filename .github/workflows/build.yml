@@ -86,7 +86,7 @@ jobs:
       - name: Create Release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "agent-diary-linux/*,agent-diary-macos/*,agent-diary-windows/*"
+          artifacts: "agent-diary-linux/**,agent-diary-macos/**,agent-diary-windows/**"
           draft: true
           generateReleaseNotes: true
           name: Agent Diary v${{ github.ref_name }}
