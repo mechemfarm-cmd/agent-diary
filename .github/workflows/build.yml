@@ -83,14 +83,13 @@ jobs:
         run: find . -type f | sort
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: |
-            agent-diary-linux/**/*
-            agent-diary-macos/**/*
-            agent-diary-windows/**/*
-          draft: true
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          name: Agent Diary ${{ github.ref_name }}
+        run: |
+          cd agent-diary-macos
+          ls -la
+          cd ..
+          gh release create "${{ github.ref_name }}" \
+            --draft --generate-notes \
+            --title "Agent Diary ${{ github.ref_name }}" \
+            agent-diary-macos/*.dmg agent-diary-linux/*.deb agent-diary-linux/*.AppImage agent-diary-windows/*.msi
+        env:
+          GH_TOKEN: ${{ github.token }}

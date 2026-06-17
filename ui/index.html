@@ -94,23 +94,36 @@
 
       <aside class="panel panel-interpretation" role="complementary" aria-label="Derived interpretation and annotations">
         <div id="interpHeader" class="interp-header"></div>
-        <details id="loopDetails" aria-label="Open loop analysis">
-          <summary>Open Loops</summary>
-          <ul id="loopList" class="list secondary layer-list" role="list" aria-label="Open loop analysis items"></ul>
-        </details>
-        <div class="detail-support-stack" aria-label="Supporting interpretation layers">
-          <details id="briefDetails" aria-label="Conversation brief layer">
-            <summary>Conversation Brief</summary>
-            <div id="briefBody" class="brief-detail">No conversation brief is attached to this entry yet.</div>
+        <div class="tab-bar" role="tablist" aria-label="Detail sections">
+          <button class="tab-btn active" role="tab" aria-selected="true" data-tab="derived" id="tab-derived-btn">Derived</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="annotations" id="tab-annotations-btn">Annotations</button>
+          <button class="tab-btn" role="tab" aria-selected="false" data-tab="actions" id="tab-actions-btn">Actions</button>
+        </div>
+
+        <!-- Derived tab -->
+        <div id="tab-derived" class="tab-panel active" role="tabpanel" aria-labelledby="tab-derived-btn">
+          <details id="loopDetails" aria-label="Open loop analysis">
+            <summary>Open Loops</summary>
+            <ul id="loopList" class="list secondary layer-list" role="list" aria-label="Open loop analysis items"></ul>
           </details>
-          <details id="memoryDetails" aria-label="Compressed memory layer" hidden>
-            <summary>Compressed Memory (Agent Layer)</summary>
-            <ul id="memoryArtifactList" class="list secondary layer-list" role="list" aria-label="Compressed memory artifacts"></ul>
-          </details>
-          <details id="workTraceDetails" aria-label="Agent work trace">
-            <summary>Agent Work</summary>
-            <ul id="workTraceList" class="list secondary layer-list" role="list" aria-label="Agent work events"></ul>
-          </details>
+          <div class="detail-support-stack" aria-label="Supporting interpretation layers">
+            <details id="briefDetails" aria-label="Conversation brief layer">
+              <summary>Conversation Brief</summary>
+              <div id="briefBody" class="brief-detail">No conversation brief is attached to this entry yet.</div>
+            </details>
+            <details id="memoryDetails" aria-label="Compressed memory layer" hidden>
+              <summary>Compressed Memory (Agent Layer)</summary>
+              <ul id="memoryArtifactList" class="list secondary layer-list" role="list" aria-label="Compressed memory artifacts"></ul>
+            </details>
+            <details id="workTraceDetails" aria-label="Agent work trace">
+              <summary>Agent Work</summary>
+              <ul id="workTraceList" class="list secondary layer-list" role="list" aria-label="Agent work events"></ul>
+            </details>
+          </div>
+        </div>
+
+        <!-- Annotations tab -->
+        <div id="tab-annotations" class="tab-panel" role="tabpanel" aria-labelledby="tab-annotations-btn">
           <details id="overlayDetails" aria-label="Overlay annotations">
             <summary>Overlays (Annotations / Corrections)</summary>
             <form id="overlayForm" class="overlay-form" aria-label="Add overlay annotation">
@@ -128,6 +141,14 @@
             <p id="overlayStatus" class="status-line" role="status" aria-live="polite"></p>
             <ul id="overlayList" class="list secondary layer-list" role="list" aria-label="Entry overlays"></ul>
           </details>
+          <details id="artifactDetails" aria-label="Secondary artifact metadata">
+            <summary>Derived / Support Artifacts</summary>
+            <ul id="artifactList" class="list secondary layer-list" role="list" aria-label="Entry artifacts"></ul>
+          </details>
+        </div>
+
+        <!-- Actions tab -->
+        <div id="tab-actions" class="tab-panel" role="tabpanel" aria-labelledby="tab-actions-btn">
           <details id="refreshDerivedDetails" aria-label="Refresh derived layers">
             <summary>Refresh Derived Layers</summary>
             <p id="refreshDerivedScope" class="status-line compact-status" role="status" aria-live="polite"></p>
@@ -137,10 +158,6 @@
               <button id="refreshMemoryBtn" type="button">Refresh Compressed Memory</button>
             </div>
             <p id="refreshDerivedStatus" class="status-line" role="status" aria-live="polite"></p>
-          </details>
-          <details id="artifactDetails" aria-label="Secondary artifact metadata">
-            <summary>Derived / Support Artifacts</summary>
-            <ul id="artifactList" class="list secondary layer-list" role="list" aria-label="Entry artifacts"></ul>
           </details>
         </div>
       </aside>

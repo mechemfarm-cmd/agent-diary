@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable
 
 from agent_diary.config import Paths
@@ -31,6 +33,8 @@ class AgentDiaryHandler(BaseHTTPRequestHandler):
         "/fetch_entry_detail": handlers.fetch_entry_detail,
     }
 
+    ui_root: Path | None = None
+
     def _send_json(self, code: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(code)
@@ -42,6 +46,32 @@ class AgentDiaryHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_file(self, file_path: Path) -> None:
+        if not file_path.is_file():
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        content = file_path.read_bytes()
+        mime_type, _ = mimetypes.guess_type(str(file_path))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _resolve_ui_path(self, url_path: str) -> Path | None:
+        if self.ui_root is None:
+            return None
+        # Strip query string
+        clean_path = url_path.split("?")[0]
+        # Normalise and prevent directory traversal
+        clean = Path(clean_path).as_posix().lstrip("/")
+        resolved = (self.ui_root / clean).resolve()
+        if not str(resolved).startswith(str(self.ui_root.resolve())):
+            return None  # traversal attempt
+        if resolved.is_dir():
+            resolved = resolved / "index.html"
+        return resolved
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -52,6 +82,11 @@ class AgentDiaryHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/status":
             self._send_json(HTTPStatus.OK, handlers.status(self.server.paths))
+            return
+        # Serve UI static files
+        file_path = self._resolve_ui_path(self.path)
+        if file_path is not None:
+            self._send_file(file_path)
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -77,6 +112,9 @@ class AgentDiaryHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], paths: Paths):
         super().__init__(server_address, AgentDiaryHandler)
         self.paths = paths
+        # Point the handler at the UI directory
+        ui_dir = paths.root / "ui"
+        AgentDiaryHandler.ui_root = ui_dir if ui_dir.is_dir() else None
 
 
 def run_server(paths: Paths, host: str = "127.0.0.1", port: int = 8041) -> None:

@@ -1,5 +1,7 @@
+const apiBase = window.origin || `${window.location.protocol}//${window.location.host}`;
+
 const state = {
-  apiBase: "http://127.0.0.1:8041",
+  apiBase: apiBase,
   limit: 100,
   offset: 0,
   sourceConversationId: "",
@@ -12,6 +14,13 @@ const state = {
   openedFromSearchHit: null,
 };
 const STORAGE_KEY = "agentDiaryUiStateV2";
+
+/** Escape HTML special characters to prevent XSS */
+function esc(str) {
+  const div = document.createElement("div");
+  div.appendChild(document.createTextNode(String(str ?? "")));
+  return div.innerHTML;
+}
 
 const apiBaseInput = document.getElementById("apiBase");
 const reloadBtn = document.getElementById("reloadBtn");
@@ -105,16 +114,25 @@ const SPEAKER_TONES = [
 ];
 
 async function post(path, payload) {
-  const response = await fetch(`${state.apiBase}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json();
-  if (!response.ok || data.ok === false) {
-    throw new Error(data.error || `HTTP ${response.status}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(`${state.apiBase}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+    return data.result || data;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
-  return data.result || data;
 }
 
 async function checkConnection() {
@@ -173,15 +191,39 @@ function renderTimeline(items) {
 function buildTimelineItem(item) {
   const li = document.createElement("li");
   li.className = "item";
-  const briefHtml = item.brief ? `<div class="brief">${item.brief}</div>` : "";
-  li.innerHTML = `
-    <button data-entry-id="${item.entry_id}" aria-current="${state.selectedEntryId === item.entry_id ? "true" : "false"}" class="${state.selectedEntryId === item.entry_id ? "active" : ""}">
-      <div class="muted">${formatEntryTime(item.created_at)} · ${item.entry_type} · ${item.source} · ${item.author_role}</div>
-      ${briefHtml}
-      <div class="preview">${item.preview}</div>
-    </button>
-  `;
-  li.querySelector("button").addEventListener("click", () => loadEntry(item.entry_id));
+  const btn = document.createElement("button");
+  btn.setAttribute("data-entry-id", item.entry_id);
+  btn.setAttribute("aria-current", state.selectedEntryId === item.entry_id ? "true" : "false");
+  if (state.selectedEntryId === item.entry_id) btn.className = "active";
+
+  const meta = document.createElement("div");
+  meta.className = "muted";
+  meta.textContent = `${formatEntryTime(item.created_at)} · ${item.entry_type} · ${item.source} · ${item.author_role}`;
+  btn.appendChild(meta);
+
+  // Work trace indicator badge
+  if (item.work_trace_count > 0) {
+    const wtBadge = document.createElement("span");
+    wtBadge.className = "wt-badge";
+    wtBadge.textContent = `${item.work_trace_count} work`;
+    wtBadge.title = `${item.work_trace_count} agent work event(s)`;
+    meta.appendChild(wtBadge);
+  }
+
+  if (item.brief) {
+    const brief = document.createElement("div");
+    brief.className = "brief";
+    brief.textContent = item.brief;
+    btn.appendChild(brief);
+  }
+
+  const preview = document.createElement("div");
+  preview.className = "preview";
+  preview.textContent = item.preview;
+  btn.appendChild(preview);
+
+  btn.addEventListener("click", () => loadEntry(item.entry_id));
+  li.appendChild(btn);
   return li;
 }
 
@@ -244,8 +286,8 @@ function buildOverlayStalenessHtml(artifact) {
     <div class="stale-badge" role="note" aria-label="Artifact may be stale after overlay">
       May be stale after overlay
     </div>
-    <div class="muted stale-meta">artifact generated: ${generatedAt}</div>
-    <div class="muted stale-meta">latest overlay: ${overlayAt}</div>
+    <div class="muted stale-meta">artifact generated: ${esc(generatedAt)}</div>
+    <div class="muted stale-meta">latest overlay: ${esc(overlayAt)}</div>
   `;
 }
 
@@ -255,20 +297,20 @@ function buildSourceEntryLinksHtml(sourceEntryIds) {
     return '<span class="muted">none</span>';
   }
   return ids
-    .map((id) => `<button class="support-link" type="button" data-support-entry-id="${id}">${id}</button>`)
+    .map((id) => `<button class="support-link" type="button" data-support-entry-id="${esc(id)}">${esc(id)}</button>`)
     .join(" ");
 }
 
 function buildProvenanceHtml(artifact) {
   const p = artifact?.provenance || {};
   const rows = [];
-  if (p.schema_version) rows.push(`<div class="muted"><strong>schema:</strong> ${p.schema_version}</div>`);
-  if (p.method) rows.push(`<div class="muted"><strong>method:</strong> ${p.method}</div>`);
-  if (p.method_version) rows.push(`<div class="muted"><strong>method version:</strong> ${p.method_version}</div>`);
-  if (p.generated_at) rows.push(`<div class="muted"><strong>generated:</strong> ${formatMetaDateTime(p.generated_at)}</div>`);
+  if (p.schema_version) rows.push(`<div class="muted"><strong>schema:</strong> ${esc(p.schema_version)}</div>`);
+  if (p.method) rows.push(`<div class="muted"><strong>method:</strong> ${esc(p.method)}</div>`);
+  if (p.method_version) rows.push(`<div class="muted"><strong>method version:</strong> ${esc(p.method_version)}</div>`);
+  if (p.generated_at) rows.push(`<div class="muted"><strong>generated:</strong> ${esc(formatMetaDateTime(p.generated_at))}</div>`);
   if (p.analysis_window && (p.analysis_window.start || p.analysis_window.end)) {
     rows.push(
-      `<div class="muted"><strong>window:</strong> ${p.analysis_window.start || "?"} → ${p.analysis_window.end || "?"}</div>`
+      `<div class="muted"><strong>window:</strong> ${esc(p.analysis_window.start || "?")} → ${esc(p.analysis_window.end || "?")}</div>`
     );
   }
   const sourceIdsHtml = buildSourceEntryLinksHtml(p.source_entry_ids);
@@ -394,52 +436,92 @@ function renderLoops(loopArtifacts) {
     const li = document.createElement("li");
     li.className = "item";
     const loops = Array.isArray(artifact.open_loops) ? artifact.open_loops : [];
-    li.innerHTML =
-      '<div><strong>' + (artifact.artifact_type || "analysis:open-loop") + "</strong></div>" +
-      '<div class="muted">' + formatMetaDateTime(artifact.created_at || "") + "</div>" +
-      '<div class="muted">producer: ' + (artifact.producer || "") + "</div>" +
-      '<div class="muted">status: ' +
-      (artifact.lifecycle_status || "active") +
-      (artifact.is_current ? " · current" : "") +
-      "</div>" +
-      buildProvenanceHtml(artifact) +
-      buildOverlayStalenessHtml(artifact) +
-      '<div class="derived-badge">Derived Interpretation</div>' +
-      '<div class="muted">Open loops: ' + loops.length + "</div>" +
-      '<ul class="loop-list">' +
-      loops
-        .map((loop) => {
-          const strength = loop?.signals?.strength || "unknown";
-          const confidence =
-            typeof loop?.signals?.confidence === "number"
-              ? " (" + Math.round(loop.signals.confidence * 100) + "%)"
-              : "";
-          const links = Array.isArray(loop.supporting_entry_ids)
-            ? loop.supporting_entry_ids
-                .map((id) => '<button class="support-link" type="button" data-support-entry-id="' + id + '">' + id + "</button>")
-                .join(" ")
-            : "";
-          return (
-            '<li class="loop-item">' +
-            "<div><strong>" + (loop.title || "Open loop") + "</strong></div>" +
-            '<div class="muted">' + (loop.summary || "") + "</div>" +
-            '<div class="muted">strength: ' + strength + confidence + "</div>" +
-            '<div class="muted">supporting entries:</div>' +
-            '<div class="support-links">' +
-            (links || '<span class="muted">none</span>') +
-            "</div>" +
-            "</li>"
-          );
-        })
-        .join("") +
-      "</ul>";
-    for (const btn of li.querySelectorAll("button[data-support-entry-id]")) {
-      btn.addEventListener("click", async () => {
-        const id = btn.getAttribute("data-support-entry-id");
-        if (!id) return;
-        await loadEntry(id);
-      });
+
+    // Header
+    const headDiv = document.createElement("div");
+    const headStrong = document.createElement("strong");
+    headStrong.textContent = artifact.artifact_type || "analysis:open-loop";
+    headDiv.appendChild(headStrong);
+    li.appendChild(headDiv);
+
+    // Meta
+    function addMeta(text) {
+      const d = document.createElement("div");
+      d.className = "muted";
+      d.textContent = text;
+      li.appendChild(d);
     }
+    addMeta(formatMetaDateTime(artifact.created_at || ""));
+    addMeta("producer: " + (artifact.producer || ""));
+    addMeta("status: " + (artifact.lifecycle_status || "active") + (artifact.is_current ? " · current" : ""));
+
+    // Build provenance/overlay sections (these use safe esc() internally)
+    li.insertAdjacentHTML("beforeend", buildProvenanceHtml(artifact));
+    li.insertAdjacentHTML("beforeend", buildOverlayStalenessHtml(artifact));
+
+    const badge = document.createElement("div");
+    badge.className = "derived-badge";
+    badge.textContent = "Derived Interpretation";
+    li.appendChild(badge);
+
+    addMeta("Open loops: " + loops.length);
+
+    const ul = document.createElement("ul");
+    ul.className = "loop-list";
+    for (const loop of loops) {
+      const itemLi = document.createElement("li");
+      itemLi.className = "loop-item";
+
+      const titleDiv = document.createElement("div");
+      const titleStrong = document.createElement("strong");
+      titleStrong.textContent = loop.title || "Open loop";
+      titleDiv.appendChild(titleStrong);
+      itemLi.appendChild(titleDiv);
+
+      if (loop.summary) {
+        const sumDiv = document.createElement("div");
+        sumDiv.className = "muted";
+        sumDiv.textContent = loop.summary;
+        itemLi.appendChild(sumDiv);
+      }
+
+      const strength = loop?.signals?.strength || "unknown";
+      const confidence = typeof loop?.signals?.confidence === "number"
+        ? " (" + Math.round(loop.signals.confidence * 100) + "%)" : "";
+      const sigDiv = document.createElement("div");
+      sigDiv.className = "muted";
+      sigDiv.textContent = "strength: " + strength + confidence;
+      itemLi.appendChild(sigDiv);
+
+      const suppLabel = document.createElement("div");
+      suppLabel.className = "muted";
+      suppLabel.textContent = "supporting entries:";
+      itemLi.appendChild(suppLabel);
+
+      const linksDiv = document.createElement("div");
+      linksDiv.className = "support-links";
+      if (Array.isArray(loop.supporting_entry_ids) && loop.supporting_entry_ids.length) {
+        for (const id of loop.supporting_entry_ids) {
+          const btn = document.createElement("button");
+          btn.className = "support-link";
+          btn.type = "button";
+          btn.setAttribute("data-support-entry-id", id);
+          btn.textContent = id;
+          btn.addEventListener("click", async () => {
+            if (id) await loadEntry(id);
+          });
+          linksDiv.appendChild(btn);
+        }
+      } else {
+        const noneSpan = document.createElement("span");
+        noneSpan.className = "muted";
+        noneSpan.textContent = "none";
+        linksDiv.appendChild(noneSpan);
+      }
+      itemLi.appendChild(linksDiv);
+      ul.appendChild(itemLi);
+    }
+    li.appendChild(ul);
     loopList.appendChild(li);
   }
 }
@@ -586,25 +668,29 @@ function renderInterpHeader(briefArtifacts, loopArtifacts, memoryArtifacts, work
 function renderScopeBar() {
   const pills = [];
   if (state.sourceConversationId) {
-    pills.push('<span class="scope-pill">conversation: ' + state.sourceConversationId + "</span>");
+    pills.push({ label: "conversation: " + state.sourceConversationId, cls: "scope-pill" });
   }
   if (state.importId) {
-    pills.push('<span class="scope-pill">import: ' + state.importId + "</span>");
+    pills.push({ label: "import: " + state.importId, cls: "scope-pill" });
   }
   if (state.truthfulOnly) {
-    pills.push('<span class="scope-pill">truthful only</span>');
+    pills.push({ label: "truthful only", cls: "scope-pill" });
   }
-  if (!pills.length) {
-    scopeBar.innerHTML = "";
-    return;
+  scopeBar.innerHTML = "";
+  if (!pills.length) return;
+  for (const p of pills) {
+    const span = document.createElement("span");
+    span.className = p.cls;
+    span.textContent = p.label;
+    scopeBar.appendChild(span);
   }
-  scopeBar.innerHTML = pills.join("") + '<button type="button" class="scope-clear-btn" data-clear-scope="true">Clear scope ×</button>';
-  const btn = scopeBar.querySelector("button[data-clear-scope='true']");
-  if (btn) {
-    btn.addEventListener("click", async () => {
-      await clearScopeState();
-    });
-  }
+  const clearBtn = document.createElement("button");
+  clearBtn.type = "button";
+  clearBtn.className = "scope-clear-btn";
+  clearBtn.setAttribute("data-clear-scope", "true");
+  clearBtn.textContent = "Clear scope ×";
+  clearBtn.addEventListener("click", async () => { await clearScopeState(); });
+  scopeBar.appendChild(clearBtn);
 }
 
 function renderRecallBanner(hit) {
@@ -614,15 +700,21 @@ function renderRecallBanner(hit) {
   }
   const layer = hit.match_layer === "compressed_memory" ? "compressed memory" : "direct match";
   recallBanner.hidden = false;
-  recallBanner.innerHTML =
-    "<div><strong>Found via " + layer + ':</strong> "' + (hit.match_text || "") + '"</div>' +
-    '<button type="button" class="scope-clear-btn" data-dismiss-recall="true" aria-label="Dismiss recall context">×</button>';
-  const btn = recallBanner.querySelector("button[data-dismiss-recall='true']");
-  if (btn) {
-    btn.addEventListener("click", () => {
-      clearRecallBanner();
-    });
-  }
+  recallBanner.innerHTML = "";
+  const bannerDiv = document.createElement("div");
+  const strong = document.createElement("strong");
+  strong.textContent = "Found via " + layer + ": ";
+  bannerDiv.appendChild(strong);
+  bannerDiv.append('"' + (hit.match_text || "") + '"');
+  recallBanner.appendChild(bannerDiv);
+  const dismissBtn = document.createElement("button");
+  dismissBtn.type = "button";
+  dismissBtn.className = "scope-clear-btn";
+  dismissBtn.setAttribute("data-dismiss-recall", "true");
+  dismissBtn.setAttribute("aria-label", "Dismiss recall context");
+  dismissBtn.textContent = "×";
+  dismissBtn.addEventListener("click", () => { clearRecallBanner(); });
+  recallBanner.appendChild(dismissBtn);
 }
 
 function clearRecallBanner() {
@@ -724,14 +816,31 @@ function renderDetail(detail) {
   for (const artifact of memoryArtifacts) {
     const li = document.createElement("li");
     li.className = "item";
-    li.innerHTML = `
-      <div><strong>${artifact.artifact_type || "compressed-memory"}</strong></div>
-      <div class="muted">${formatMetaDateTime(artifact.created_at || "")}</div>
-      <div class="muted">producer: ${artifact.producer || ""}</div>
-      ${buildProvenanceHtml(artifact)}
-      ${buildOverlayStalenessHtml(artifact)}
-      <pre class="artifact-body">${artifact.content || ""}</pre>
-    `;
+
+    const headDiv = document.createElement("div");
+    const headStrong = document.createElement("strong");
+    headStrong.textContent = artifact.artifact_type || "compressed-memory";
+    headDiv.appendChild(headStrong);
+    li.appendChild(headDiv);
+
+    const meta = document.createElement("div");
+    meta.className = "muted";
+    meta.textContent = formatMetaDateTime(artifact.created_at || "");
+    li.appendChild(meta);
+
+    const prod = document.createElement("div");
+    prod.className = "muted";
+    prod.textContent = "producer: " + (artifact.producer || "");
+    li.appendChild(prod);
+
+    li.insertAdjacentHTML("beforeend", buildProvenanceHtml(artifact));
+    li.insertAdjacentHTML("beforeend", buildOverlayStalenessHtml(artifact));
+
+    const pre = document.createElement("pre");
+    pre.className = "artifact-body";
+    pre.textContent = artifact.content || "";
+    li.appendChild(pre);
+
     for (const btn of li.querySelectorAll("button[data-support-entry-id]")) {
       btn.addEventListener("click", async () => {
         const id = btn.getAttribute("data-support-entry-id");
@@ -753,11 +862,19 @@ function renderDetail(detail) {
   for (const overlay of overlays) {
     const li = document.createElement("li");
     li.className = "item";
-    li.innerHTML = `
-      <div><strong>${overlay.overlay_type || "overlay"}</strong></div>
-      <div class="muted">${formatMetaDateTime(overlay.created_at || "")} · author: ${overlay.author || ""}</div>
-      <pre class="artifact-body">${overlay.content || ""}</pre>
-    `;
+    const headDiv = document.createElement("div");
+    const headStrong = document.createElement("strong");
+    headStrong.textContent = overlay.overlay_type || "overlay";
+    headDiv.appendChild(headStrong);
+    li.appendChild(headDiv);
+    const meta = document.createElement("div");
+    meta.className = "muted";
+    meta.textContent = formatMetaDateTime(overlay.created_at || "") + " · author: " + (overlay.author || "");
+    li.appendChild(meta);
+    const pre = document.createElement("pre");
+    pre.className = "artifact-body";
+    pre.textContent = overlay.content || "";
+    li.appendChild(pre);
     overlayList.appendChild(li);
   }
   overlayDetails.open = overlays.length > 0;
@@ -772,15 +889,29 @@ function renderDetail(detail) {
   for (const artifact of secondaryArtifacts) {
     const li = document.createElement("li");
     li.className = "item";
-    li.innerHTML = `
-      <div><strong>${artifact.artifact_type || "artifact"}</strong></div>
-      <div class="muted">${formatMetaDateTime(artifact.created_at || "")}</div>
-      <div class="muted">producer: ${artifact.producer || ""}</div>
-      <div class="muted">id: ${artifact.artifact_id || ""}</div>
-      <div class="muted">status: ${artifact.lifecycle_status || "active"}${artifact.is_current ? " · current" : ""}</div>
-      ${buildProvenanceHtml(artifact)}
-      ${buildOverlayStalenessHtml(artifact)}
-    `;
+    const headDiv = document.createElement("div");
+    const headStrong = document.createElement("strong");
+    headStrong.textContent = artifact.artifact_type || "artifact";
+    headDiv.appendChild(headStrong);
+    li.appendChild(headDiv);
+    const meta = document.createElement("div");
+    meta.className = "muted";
+    meta.textContent = formatMetaDateTime(artifact.created_at || "");
+    li.appendChild(meta);
+    const prod = document.createElement("div");
+    prod.className = "muted";
+    prod.textContent = "producer: " + (artifact.producer || "");
+    li.appendChild(prod);
+    const idDiv = document.createElement("div");
+    idDiv.className = "muted";
+    idDiv.textContent = "id: " + (artifact.artifact_id || "");
+    li.appendChild(idDiv);
+    const statusDiv = document.createElement("div");
+    statusDiv.className = "muted";
+    statusDiv.textContent = "status: " + (artifact.lifecycle_status || "active") + (artifact.is_current ? " · current" : "");
+    li.appendChild(statusDiv);
+    li.insertAdjacentHTML("beforeend", buildProvenanceHtml(artifact));
+    li.insertAdjacentHTML("beforeend", buildOverlayStalenessHtml(artifact));
     for (const btn of li.querySelectorAll("button[data-support-entry-id]")) {
       btn.addEventListener("click", async () => {
         const id = btn.getAttribute("data-support-entry-id");
@@ -891,8 +1022,12 @@ function renderImports(items) {
 }
 
 function showError(listEl, message) {
+  listEl.innerHTML = "";
   listEl.setAttribute("aria-busy", "false");
-  listEl.innerHTML = `<li class="item error">${message}</li>`;
+  const li = document.createElement("li");
+  li.className = "item error";
+  li.textContent = message;
+  listEl.appendChild(li);
 }
 
 function wireListKeyboardNav(listEl) {
@@ -1399,6 +1534,21 @@ window.addEventListener("popstate", async () => {
     loopDetails.open = false;
   }
   isApplyingUrlState = false;
+});
+
+// Tab switching for right panel
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach((b) => {
+      b.classList.remove("active");
+      b.setAttribute("aria-selected", "false");
+    });
+    btn.classList.add("active");
+    btn.setAttribute("aria-selected", "true");
+    document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+    const panel = document.getElementById(`tab-${btn.dataset.tab}`);
+    if (panel) panel.classList.add("active");
+  });
 });
 
 init();

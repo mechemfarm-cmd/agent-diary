@@ -63,6 +63,12 @@ def insert_work_trace_event(db_path: Path, event: WorkTraceEvent, work_file_path
                 work_file_path,
             ),
         )
+        # Index entry links for efficient lookup
+        for entry_id in event.related_entry_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO work_trace_entry_links(event_id, entry_id) VALUES (?, ?)",
+                (event.event_id, entry_id),
+            )
         conn.commit()
 
 
@@ -181,6 +187,70 @@ def search_work_trace(
 
     scored.sort(key=lambda r: (r["_score"], r["created_at"], r["event_id"]), reverse=True)
     return [{k: v for k, v in row.items() if k not in {"_score", "searchable_text"}} for row in scored[:limit]]
+
+
+def list_work_trace_events_for_entry(db_path: Path, entry_id: str) -> list[dict[str, Any]]:
+    """Fast lookup of work trace events linked to an entry via the junction index."""
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT wte.event_id, wte.created_at, wte.event_type, wte.summary,
+                   wte.project, wte.source_surface, wte.actor, wte.session_key,
+                   wte.task_id, wte.work_file_path
+            FROM work_trace_events wte
+            JOIN work_trace_entry_links link ON link.event_id = wte.event_id
+            WHERE link.entry_id = ?
+            ORDER BY wte.created_at DESC, wte.event_id DESC
+            """,
+            (entry_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def backfill_work_trace_entry_links(db_path: Path) -> int:
+    """Populate the junction table from existing work trace files. Returns count of links added."""
+    import json
+    from pathlib import Path as P
+    count = 0
+    with closing(sqlite3.connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT event_id, work_file_path FROM work_trace_events"
+        ).fetchall()
+        for event_id, work_file_path in rows:
+            fp = P(work_file_path)
+            if not fp.exists():
+                continue
+            try:
+                body = json.loads(fp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for entry_id in body.get("related_entry_ids", []):
+                conn.execute(
+                    "INSERT OR IGNORE INTO work_trace_entry_links(event_id, entry_id) VALUES (?, ?)",
+                    (event_id, entry_id),
+                )
+                count += 1
+        conn.commit()
+    return count
+
+
+def list_work_trace_counts_for_entries(db_path: Path, entry_ids: list[str]) -> dict[str, int]:
+    """Return a map of entry_id -> work trace event count for the given entry IDs."""
+    if not entry_ids:
+        return {}
+    with closing(sqlite3.connect(db_path)) as conn:
+        placeholders = ",".join(["?"] * len(entry_ids))
+        rows = conn.execute(
+            f"""
+            SELECT link.entry_id, COUNT(link.event_id) AS cnt
+            FROM work_trace_entry_links link
+            WHERE link.entry_id IN ({placeholders})
+            GROUP BY link.entry_id
+            """,
+            entry_ids,
+        ).fetchall()
+    return {str(row[0]): int(row[1]) for row in rows}
 
 
 def search_memory(db_path: Path, query: str, limit: int = 20) -> list[dict[str, Any]]:

@@ -22,6 +22,7 @@ from agent_diary.index.repository import (
     insert_work_trace_event,
     list_entry_rows,
     list_work_trace_rows,
+    list_work_trace_counts_for_entries,
     search_memory as search_index,
     search_work_trace as search_work_trace_index,
 )
@@ -97,11 +98,10 @@ def _normalize_string_list(value: Any, *, field_name: str) -> list[str]:
 
 
 def _append_work_trace_best_effort(paths: Paths, payload: dict[str, Any]) -> None:
-    # Work-trace capture is secondary and should not block the primary operation.
     try:
         append_work_trace_event(paths, payload)
-    except Exception:
-        return
+    except Exception as exc:
+        print(f"[agent-diary] WARN: work trace append failed: {exc}")
 
 
 def append_work_trace_event(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
@@ -711,13 +711,9 @@ def list_imports(paths: Paths, payload: dict[str, Any] | None = None) -> dict[st
     manifests = list_import_batch_manifests(paths, limit=limit)
     items: list[dict[str, Any]] = []
     for manifest in manifests:
-        import_result = manifest.get("import_result", {})
-        if not isinstance(import_result, dict):
-            import_result = {}
         items.append(
             {
                 "import_id": manifest.get("import_id"),
-                "import_label": manifest.get("import_label"),
                 "imported_at": manifest.get("imported_at"),
                 "imported_count": manifest.get("imported_count"),
                 "skipped_duplicate_count": manifest.get("skipped_count"),
@@ -1646,6 +1642,16 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
             }
         items.append(item)
 
+    # Batch query work trace counts for all returned items
+    try:
+        from agent_diary.index.repository import list_work_trace_counts_for_entries as _wt_counts
+        entry_ids = [item["entry_id"] for item in items]
+        wt_map = _wt_counts(paths.sqlite_path, entry_ids)
+        for item in items:
+            item["work_trace_count"] = wt_map.get(item["entry_id"], 0)
+    except Exception:
+        pass  # non-critical; timeline will show no badge
+
     return {
         "limit": limit,
         "offset": row_offset,
@@ -1844,11 +1850,48 @@ def _find_linked_open_loop_artifacts(paths: Paths, *, entry_id: str, exclude_art
 
 
 def _find_work_trace_events_for_entry(paths: Paths, *, entry_id: str) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
+    import json as _json
+    from agent_diary.index.repository import list_work_trace_events_for_entry as _list_wt
+
+    # Primary path: indexed SQLite lookup (fast)
+    indexed_rows = _list_wt(paths.sqlite_path, entry_id)
+    if indexed_rows:
+        events: list[dict[str, Any]] = []
+        for row in indexed_rows:
+            wf = Path(row["work_file_path"])
+            try:
+                body = _json.loads(wf.read_text(encoding="utf-8"))
+            except (OSError, _json.JSONDecodeError):
+                body = {}
+            details = body.get("details")
+            events.append(
+                {
+                    "event_id": body.get("event_id") or row["event_id"],
+                    "event_type": body.get("event_type") or row["event_type"],
+                    "summary": body.get("summary") or row["summary"],
+                    "created_at": body.get("created_at") or row["created_at"],
+                    "project": body.get("project"),
+                    "source_surface": body.get("source_surface"),
+                    "actor": body.get("actor"),
+                    "session_key": body.get("session_key"),
+                    "task_id": body.get("task_id"),
+                    "details": details if isinstance(details, dict) else {},
+                    "related_entry_ids": [str(item).strip() for item in body.get("related_entry_ids", []) if str(item).strip()],
+                    "related_artifact_ids": [str(item).strip() for item in body.get("related_artifact_ids", []) if str(item).strip()],
+                    "related_paths": [str(item).strip() for item in body.get("related_paths", []) if str(item).strip()],
+                    "tags": [str(item).strip() for item in body.get("tags", []) if str(item).strip()],
+                    "work_file_path": str(wf),
+                }
+            )
+        events.sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("event_id", ""))), reverse=True)
+        return events
+
+    # Fallback: full filesystem scan (for legacy data before migration)
+    events = []
     for work_file in paths.work_trace_dir.rglob("*.json"):
         try:
-            body = json.loads(work_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            body = _json.loads(work_file.read_text(encoding="utf-8"))
+        except (OSError, _json.JSONDecodeError):
             continue
         related_entry_ids = [str(item).strip() for item in body.get("related_entry_ids", []) if str(item).strip()]
         if entry_id not in related_entry_ids:

@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS memory_index (
   FOREIGN KEY (entry_id) REFERENCES entries(entry_id),
   FOREIGN KEY (artifact_id) REFERENCES artifacts(artifact_id)
 );
+
+CREATE TABLE IF NOT EXISTS work_trace_entry_links (
+  event_id TEXT NOT NULL,
+  entry_id TEXT NOT NULL,
+  PRIMARY KEY (event_id, entry_id),
+  FOREIGN KEY (event_id) REFERENCES work_trace_events(event_id),
+  FOREIGN KEY (entry_id) REFERENCES entries(entry_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_wtel_entry_id ON work_trace_entry_links(entry_id);
 """
 
 

@@ -1,133 +1,95 @@
 # Simple Parallel-Use Routine
 
-This is the smallest practical routine for using Agent Diary beside normal OpenClaw memory.
+This is the smallest practical routine for using Agent Diary beside normal Hermes memory.
 
 Principle:
-- OpenClaw memory remains the primary working memory for now.
+- Hermes memory remains the primary working memory for now.
 - Agent Diary runs in parallel as the inspectable truth, work-trace, and derived-recall layer.
+- **Daily cron import** (`hermes-to-diary.sh`) imports new Hermes sessions automatically once per day.
 
-## When to run it
+## Architecture (current)
 
-Run this loop:
-- after a meaningful Bill/Tom conversation block
-- after a coding/debugging stretch you want preserved
-- or at least once per day during the trial
+| Component | How it runs |
+|-----------|-------------|
+| API + UI server | Single process: `agent-diary serve --host 0.0.0.0 --port 8041` |
+| UI files | Served from the API server (no separate static server) |
+| Auto-import | Daily cron job via `~/.hermes/scripts/hermes-to-diary.sh` |
+| Tailscale URL | `http://100.101.169.71:8041/` |
+| Home WiFi URL | `http://192.168.178.40:8041/` |
 
-## 1. Make sure the local app is up on Emily
+The UI auto-detects the API server from `window.location.origin` — no URL configuration needed.
 
-Backend:
+## When to use it
 
-```bash
-cd /home/willard/development/agent-diary
-PYTHONPATH=src python3 -m agent_diary.cli.main serve --host 127.0.0.1 --port 8041
-```
+Open the UI when you want:
+- verbatim recall of a conversation
+- scoped inspection of a real conversation block
+- searchable work trace
+- open-loop review
+- raw-entry trust verification
 
-UI:
+## How the daily pipeline works
 
-```bash
-cd /home/willard/development/agent-diary
-python3 -m http.server 5173 --bind 127.0.0.1 --directory ui
-```
+1. A cron job runs `hermes-to-diary.sh` once per day
+2. It queries `~/.hermes/state.db` for sessions not yet imported
+3. For each new session, it extracts user + assistant messages
+4. Imports them as diary entries via `agent-diary import-session-and-analyze`
+5. This automatically generates conversation briefs, compressed memory, and open loops
+6. Markers in `data/hermes-import-tracker/` prevent double-importing
 
-## 2. Import recent Telegram direct-chat truth
+## Manual import (if needed)
 
-For ongoing use, prefer the one-shot bounded import:
-
-```bash
-cd /home/willard/development/agent-diary
-PYTHONPATH=src python3 -m agent_diary.cli.main --json import-telegram-direct \
-  --inbound-path /home/willard/.openclaw/agents/main/sessions/sessions.json.telegram-messages.json \
-  --sessions-root /home/willard/.openclaw/agents/main/sessions \
-  --chat-id 713733361 \
-  --source telegram-direct-import
-```
-
-This is the normal truth import path for ongoing direct-chat use.
-
-## 3. Import recent work trace
-
-For the same session key, pull in recent OpenClaw work trace:
+If you want to import immediately rather than waiting for the daily cron:
 
 ```bash
 cd /home/willard/development/agent-diary
-PYTHONPATH=src python3 -m agent_diary.cli.main --json backfill-openclaw-work-trace-session-key \
-  --session-key 'agent:main:telegram:default:direct:713733361' \
-  --trajectories-root /home/willard/.openclaw/agents/main/sessions \
-  --days-back 1
+bash ~/.hermes/scripts/hermes-to-diary.sh
 ```
 
-If a day-back window is too broad later, tighten it with `--since` / `--until`.
+Or trigger the cron job from the agent:
 
-## 4. Find the latest import batch
-
-```bash
-cd /home/willard/development/agent-diary
-PYTHONPATH=src python3 -m agent_diary.cli.main --json list-imports --limit 5
+```
+Run the daily import now
 ```
 
-Use the newest `import_id` from the result.
+## Use the UI as the inspection surface
 
-## 5. Refresh derived layers for that import
+Open in any browser:
 
-```bash
-cd /home/willard/development/agent-diary
-PYTHONPATH=src python3 -m agent_diary.cli.main --json produce-open-loops \
-  --import-id <IMPORT_ID> \
-  --truthful-only \
-  --limit 200
 ```
-
-```bash
-cd /home/willard/development/agent-diary
-PYTHONPATH=src python3 -m agent_diary.cli.main --json produce-conversation-briefs \
-  --import-id <IMPORT_ID> \
-  --truthful-only \
-  --limit 200
-```
-
-```bash
-cd /home/willard/development/agent-diary
-PYTHONPATH=src python3 -m agent_diary.cli.main --json produce-compressed-memory \
-  --import-id <IMPORT_ID> \
-  --truthful-only \
-  --limit 200
-```
-
-## 6. Use the UI as the inspection surface
-
-Open:
-
-```text
-http://127.0.0.1:5173
+http://100.101.169.71:8041/
 ```
 
 In the UI:
-- select the latest import in `Recent Imports`
-- keep `Truthful only` on when you want the clean import-bounded view
+- the timeline shows all entries with work-trace badges when agent work exists
+- the right panel has **3 tabs**: Derived, Annotations, Actions
+- select an import batch from `Recent Imports` to scope the view
+- keep `Truthful only` on for clean import-bounded view
 - inspect raw entries in the center pane
-- inspect open loops, brief, and compressed memory on the right
-- use search when you need recall, but treat raw entry detail as source of truth
+- inspect open loops, brief, and compressed memory in the Derived tab
+- add overlays in the Annotations tab
+- refresh derived layers in the Actions tab
 
-## 7. Trial behavior
+## Trial behavior
 
 During the trial:
-- use OpenClaw memory normally for fast live work
+- use Hermes memory normally for fast live work
 - use Agent Diary when you need:
   - verbatim recall
   - scoped inspection of a real conversation block
   - searchable work trace
   - open-loop review
 
-## 8. What counts as success
+## What counts as success
 
 This parallel routine is working if:
-- recent chat truth lands cleanly
+- recent chat truth lands cleanly via daily cron
 - recent work trace lands cleanly
 - derived layers attach without drama
 - UI inspection is good enough that Bill does not need to remember repo internals every minute
 
-## 9. Current rough edges
+## Current known rough edges
 
-- UI is usable, but still a little dense in the left navigation column.
-- The backend and UI are still served separately.
-- Work trace import is usable, but still OpenClaw-session-shaped rather than fully generalized.
+- Work trace import is still OpenClaw-session-shaped rather than fully generalized.
+- The UI right panel tabs are new; tab selection is not yet persisted across page reloads.
+- No mobile-responsive layout below 680px (functional but cramped).

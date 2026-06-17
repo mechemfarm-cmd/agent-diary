@@ -191,9 +191,21 @@ It includes:
 
 This panel is where you inspect what the system inferred, what work was performed, and what extra context has accumulated around the entry.
 
+The right panel is organized into **3 tabs**:
+
+| Tab | Contains |
+|-----|----------|
+| **Derived** | Open Loops, Conversation Brief, Compressed Memory, Agent Work |
+| **Annotations** | Overlays + Secondary Artifacts |
+| **Actions** | Refresh derived layer buttons |
+
+This replaces the previous 9-stacked-`<details>` layout with a categorized tabbed interface.
+
 ## Setup
 
-## Local single-machine setup
+## Setup
+
+### Local single-machine setup
 
 From the repo root:
 
@@ -204,50 +216,37 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Start the backend:
+Start the server (API + UI on one port):
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main serve --host 127.0.0.1 --port 8041
-```
-
-In a second terminal, start the UI:
-
-```bash
-cd ui
-python3 -m http.server 5173
+agent-diary serve --host 0.0.0.0 --port 8041
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:5173
+http://localhost:8041
 ```
 
-## Headless host plus remote Mac setup
+The UI auto-detects the API server from `window.location.origin` — no URL configuration needed.
 
-This is the Emily-style deployment pattern.
+### Headless host plus remote Mac setup (Emily-style)
 
-Backend and static UI run on the headless machine. The Mac connects over SSH tunnel.
-
-Example:
+The API server serves both the backend and UI files on a single port.
+On the headless machine (Emily), bind to `0.0.0.0`:
 
 ```bash
-ssh -L 5173:127.0.0.1:5173 -L 8041:127.0.0.1:8041 willard@<HOST>
+agent-diary serve --host 0.0.0.0 --port 8041
 ```
 
-Then open on the Mac:
+Access from any device on Tailscale or home WiFi:
 
 ```text
-http://127.0.0.1:5173
+http://100.101.169.71:8041/
+http://192.168.178.40:8041/
 ```
 
-The UI will talk to the tunneled API at:
-
-```text
-http://127.0.0.1:8041
-```
-
-If needed, confirm the `API Base` field in the header is set correctly.
+No SSH tunnel needed when on the same Tailscale network.
 
 ## What Happens During Normal Use
 
@@ -394,65 +393,76 @@ That is the whole point of the week: use it like a real tool and gather honest f
 
 ## Useful Commands
 
-## Start backend
+## Start server (API + UI on one port)
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main serve --host 127.0.0.1 --port 8041
-```
-
-## Start UI
-
-```bash
-cd ui
-python3 -m http.server 5173
+cd /home/willard/development/agent-diary
+agent-diary serve --host 0.0.0.0 --port 8041
 ```
 
 ## List imports
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json list-imports --limit 20
+cd /home/willard/development/agent-diary
+agent-diary list-imports --limit 20
 ```
 
 ## List entries
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json list-entries --limit 20
+cd /home/willard/development/agent-diary
+agent-diary list-entries --limit 20
 ```
 
 ## Search memory
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json search-memory --query "browser route" --limit 20
+cd /home/willard/development/agent-diary
+agent-diary search-memory --query "browser route" --limit 20
 ```
 
 ## Fetch one entry
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json fetch-raw-entry --entry-id <ENTRY_ID> --include-artifacts
+cd /home/willard/development/agent-diary
+agent-diary fetch-raw-entry --entry-id <ENTRY_ID> --include-artifacts
 ```
 
 ## Search work trace directly
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json search-work-trace --query "timeline layout" --limit 20
+cd /home/willard/development/agent-diary
+agent-diary search-work-trace --query "timeline layout" --limit 20
 ```
 
 ## Refresh conversation briefs
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json produce-conversation-briefs --import-id <IMPORT_ID> --truthful-only --limit 200
+cd /home/willard/development/agent-diary
+agent-diary produce-conversation-briefs --import-id <IMPORT_ID> --truthful-only --limit 200
 ```
 
 ## Refresh compressed memory
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json produce-compressed-memory --import-id <IMPORT_ID> --truthful-only --limit 200
+cd /home/willard/development/agent-diary
+agent-diary produce-compressed-memory --import-id <IMPORT_ID> --truthful-only --limit 200
 ```
 
 ## Refresh open loops
 
 ```bash
-PYTHONPATH=src python3 -m agent_diary.cli.main --json produce-open-loops --import-id <IMPORT_ID> --truthful-only --limit 200
+cd /home/willard/development/agent-diary
+agent-diary produce-open-loops --import-id <IMPORT_ID> --truthful-only --limit 200
+```
+
+## Daily import pipeline
+
+The cron job lives at `~/.hermes/scripts/hermes-to-diary.sh` and runs once per day.
+To trigger it manually:
+
+```bash
+bash ~/.hermes/scripts/hermes-to-diary.sh
 ```
 
 ## Troubleshooting
@@ -461,10 +471,10 @@ PYTHONPATH=src python3 -m agent_diary.cli.main --json produce-open-loops --impor
 
 Check:
 
-- the backend is running on `127.0.0.1:8041`
-- the UI server is running on `127.0.0.1:5173`
-- the `API Base` field is correct
+- the server is running: `ps aux | grep agent-diary`
+- the server binds to `0.0.0.0:8041`
 - your current scope is not accidentally too narrow
+- try `http://100.101.169.71:8041/` from another device
 
 ## Timeline is too broad
 

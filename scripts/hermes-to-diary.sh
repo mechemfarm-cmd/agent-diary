@@ -93,4 +93,14 @@ for item in out:
     echo "  ✓ Imported $chunk_count entries"
 done
 
+# ── Second pass: backfill work traces for sessions in the diary ──
+echo ""
+echo "--- Backfilling Hermes work traces ---"
+cd "$DIARY_ROOT"
+python3 scripts/backfill-hermes-work-traces.py \
+    --diary-db data/index/memory.db \
+    --hermes-db "$HERMES_DB" \
+    --data-dir data 2>&1 || echo "  ⚠ Work trace backfill had issues (non-fatal)"
+
+echo ""
 echo "=== Hermes-to-diary import complete ==="

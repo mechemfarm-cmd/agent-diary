@@ -1,83 +1,65 @@
-# Agent Diary (Scaffold)
+# Agent Diary
 
-Initial backend/service/CLI scaffold for Agent Diary.
+A permanent, inspectable memory and work-trace store for one human and one agent.
 
-## Scope in this pass
+Separates what was **said** (raw entries), what the agent **did** (work traces), and what the system **inferred** (derived memory) into inspectable layers.
 
-- New Python backend/service/CLI skeleton
-- Append-only raw entry storage shape (stubbed)
-- SQLite index bootstrap shape (stubbed)
-- Local HTTP service with placeholder routes
-- Scriptable CLI command surface
-- Data directory layout for local development
-- Placeholder `ui/` directory only
+---
+
+## Quick Start
+
+```bash
+pip install -e .
+agent-diary serve --host 0.0.0.0 --port 8041
+```
+
+Then open `http://localhost:8041` in a browser.
+
+---
+
+## For Agents
+
+If you are an autonomous agent integrating with this system, start here:
+
+- **[AGENTS.md](./AGENTS.md)** — What to do, in what order
+- **[docs/agent-integration.md](./docs/agent-integration.md)** — Full API contract, JSONL schema, query protocol
+
+## For Humans
+
+If you are the human operator:
+
+- **[docs/user-guide-v1.md](./docs/user-guide-v1.md)** — How to use the UI and interpret the panels
+- **[docs/parallel-use-routine.md](./docs/parallel-use-routine.md)** — Running Agent Diary alongside existing memory systems
+
+## Architecture
+
+| Component | What it does | Port |
+|-----------|-------------|------|
+| API server | REST API + static UI files | 8041 |
+| SQLite index | Entry metadata, work traces, memory index | (internal) |
+| File store | Raw entry JSON files, artifacts, overlays | (internal) |
+| Daily cron | Imports new sessions + work traces from Hermes | (scheduled) |
+
+The API server serves both backend and UI on a single port. No separate static server needed.
+
+## Integration Points
+
+- **Import sessions**: Feed canonical JSONL files into `agent-diary import-session-jsonl`
+- **Query memory**: `POST /search_memory` for cross-session recall
+- **Query work traces**: `POST /search_work_trace` for operational evidence
+- **Browse entries**: `POST /list_entries` with provenance scope filters
+
+See [docs/agent-integration.md](./docs/agent-integration.md) for the full API reference.
 
 ## Docs
 
-- `docs/user-guide-v1.md`
-- `docs/ui-v1-surface-contract.md`
-- `docs/future-derived-data-model.md`
-- `docs/work-trace-layer-v1.md`
-- `docs/release-v1-weekend-checklist.md`
-- `docs/review-prompt-sonnet-v1.md`
-- `docs/review-prompt-deepseek-v1.md`
-- `docs/open-loops-producer-v1.md`
-- `docs/guinea-pig-testing-quickstart.md`
-- `docs/ops-sync-authority.md`
+- `docs/user-guide-v1.md` — Complete operator guide
+- `docs/agent-integration.md` — Integration contract for agents
+- `docs/parallel-use-routine.md` — Daily parallel-use workflow
+- `docs/ui-v1-surface-contract.md` — UI data contracts
+- `docs/work-trace-layer-v1.md` — Work trace design
+- `docs/release-v1-weekend-checklist.md` — Release preparation
 
-## Quick start
+## License
 
-```bash
-cd agent-diary
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-agent-diary serve
-```
-
-## First Real Testing
-
-Use the minimal owner-testing loop in:
-
-- `docs/guinea-pig-testing-quickstart.md`
-
-It covers:
-
-- local startup
-- JSONL entry import
-- open-loop producer run
-- UI inspection flow
-
-For recurring truthful ingestion from an OpenClaw session export, use the one-command path:
-
-    PYTHONPATH=src python3 -m agent_diary.cli.main --json import-openclaw-session --input-path /path/to/34916b21-e21e-4b82-b062-07fb8d841057.jsonl
-
-Example output:
-
-```json
-{
-  "dry_run": false,
-  "resolved_source_session_id": "session-plain-1",
-  "resolved_source_conversation_id": "openclaw:session-plain-1",
-  "transcript_message_count": 4,
-  "session_chunk_count": 1,
-  "imported_count": 1,
-  "skipped_duplicate_count": 0,
-  "import_id": "import-openclaw-session-import-session-plain-1-20260521T101500Z",
-  "batch_manifest_path": "/.../data/imports/batches/import-openclaw-session-import-session-plain-1-20260521T101500Z.json"
-}
-```
-
-What the top-level summary means:
-- `resolved_source_session_id` and `resolved_source_conversation_id` are the identifiers actually used after inference or explicit override.
-- `transcript_message_count` is how many canonical transcript messages were built.
-- `session_chunk_count` is how many session-import entries were produced.
-- `imported_count` is how many raw entries were written.
-- `skipped_duplicate_count` is how many source items were skipped by the ledger.
-- `import_id` is the batch label recorded in the manifest and ledger.
-- `batch_manifest_path` points to the batch manifest file.
-
-Repeat-import behavior:
-- the importer records a ledger of prior source items under `data/imports/ledger.json`
-- repeated runs skip source items that already have the same stable source key
-- `--dry-run` shows the same counts without writing raw entries
+Internal tool. Not for public distribution.

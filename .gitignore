@@ -21,4 +21,7 @@ node_modules/
 src-tauri/target/
 
 # Python egg-info
-src/agent_diary.egg-info/
+*.egg-info/
+
+# Hermes agent config/state
+.hermes/
