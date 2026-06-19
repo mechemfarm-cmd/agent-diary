@@ -515,7 +515,7 @@ body {
   flex-direction: column;
   gap: 8px;
   min-height: 0;
-  overflow: hidden;
+  overflow-y: auto;
   flex: 1 1 auto;
 }
 
@@ -875,6 +875,9 @@ body {
   border: 1px solid rgba(185, 141, 100, 0.45);
   border-radius: 14px;
   background: rgba(255, 248, 236, 0.78);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .recall-banner {
@@ -1129,6 +1132,9 @@ body {
 
 .artifact-body {
   white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  max-width: 100%;
   font: inherit;
   margin: 10px 0 0;
   padding: 10px 12px;

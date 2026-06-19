@@ -1075,7 +1075,7 @@ async function loadTimeline() {
     if (state.importId) scopeParts.push(`import=${state.importId}`);
     if (state.truthfulOnly) scopeParts.push("truthful-only");
     const scopeLabel = scopeParts.length ? ` · scope ${scopeParts.join(", ")}` : "";
-    timelineStatus.textContent = `Showing ${result.items.length} entries · offset ${state.offset}${scopeLabel}`;
+    timelineStatus.textContent = `Showing ${result.items.length} of ${result.total ?? "?"} entries · offset ${state.offset}${scopeLabel}`;
   } catch (err) {
     showError(timelineList, `Timeline error: ${err.message}`);
     timelineStatus.textContent = "Could not load entries.";

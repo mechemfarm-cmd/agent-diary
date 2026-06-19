@@ -21,6 +21,7 @@ from agent_diary.index.repository import (
     insert_memory_index_row,
     insert_work_trace_event,
     list_entry_rows,
+    count_entry_rows,
     list_work_trace_rows,
     list_work_trace_counts_for_entries,
     search_memory as search_index,
@@ -1570,6 +1571,7 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("offset must be >= 0")
 
     row_offset = offset
+    total: int
     rows: list[dict[str, Any]]
     open_loop_participation = _build_open_loop_participation(paths)
     needs_provenance_filter = any([source_conversation_id, source_session_id, import_id, truthful_only])
@@ -1597,10 +1599,12 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
                 ),
                 reverse=True,
             )
+        total = len(filtered_rows)
         rows = filtered_rows[offset : offset + limit]
         row_offset = offset
     else:
         rows = list_entry_rows(paths.sqlite_path, limit=limit, offset=offset)
+        total = count_entry_rows(paths.sqlite_path)
     items: list[dict[str, Any]] = []
     for row in rows:
         raw_file = Path(row["raw_file_path"])
@@ -1655,6 +1659,7 @@ def list_entries(paths: Paths, payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "limit": limit,
         "offset": row_offset,
+        "total": total,
         "filters": {
             "source_conversation_id": source_conversation_id,
             "source_session_id": source_session_id,

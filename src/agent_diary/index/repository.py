@@ -335,6 +335,12 @@ def list_entry_rows(db_path: Path, *, limit: int = 20, offset: int = 0) -> list[
     return [dict(r) for r in rows]
 
 
+def count_entry_rows(db_path: Path) -> int:
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM entries").fetchone()
+        return row[0] if row else 0
+
+
 def insert_memory_index_row(
     db_path: Path,
     *,
