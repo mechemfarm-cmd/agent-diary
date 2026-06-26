@@ -1,0 +1,23 @@
+HEAD:
+a07c3cc2afc901baf9f8ab28e72047290c0d9ce0
+
+STATUS:
+## main...origin/main
+M  src/agent_diary/service/handlers.py
+M  src/agent_diary/storage/imports.py
+M  tests/test_append_entry_slice.py
+M  ui/app.js
+M  ui/index.html
+M  ui/styles.css
+?? docs/memory-engine-work-journal-2026-05-28.md
+?? examples/telegram_truth_subset.jsonl
+
+CACHED_DIFF_NAMES:
+src/agent_diary/service/handlers.py
+src/agent_diary/storage/imports.py
+tests/test_append_entry_slice.py
+ui/app.js
+ui/index.html
+ui/styles.css
+
+UNSTAGED_DIFF_NAMES:
